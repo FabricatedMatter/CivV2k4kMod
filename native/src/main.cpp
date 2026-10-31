@@ -1,0 +1,76 @@
+#include <windows.h>
+#include <shlobj.h>
+
+#include <string>
+#include <vector>
+
+#include "config.h"
+#include "core.h"
+#include "log.h"
+#include "lua_bridge.h"
+#include "redirect.h"
+
+namespace uis {
+bool LoadRealVersionDll();
+void InstallCrashLogger();
+void InstallD3DHooks();
+void InstallStrategicFix(DWORD mainThreadId);
+}
+
+using namespace uis;
+
+static std::wstring ExeDir(std::wstring* exeName) {
+  wchar_t buf[MAX_PATH];
+  GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  std::wstring p = buf;
+  size_t slash = p.find_last_of(L"\\/");
+  if (exeName) *exeName = p.substr(slash + 1);
+  return p.substr(0, slash);
+}
+
+static std::wstring UserDir() {
+  wchar_t docs[MAX_PATH];
+  if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs))) return L".";
+  return std::wstring(docs) + L"\\My Games\\Sid Meier's Civilization 5";
+}
+
+static void Init() {
+  std::wstring exeName;
+  std::wstring gameDir = ExeDir(&exeName);
+  if (_wcsicmp(exeName.c_str(), L"CivilizationV_DX11.exe") != 0) return;  // inert elsewhere
+
+  g_userDir = UserDir();
+  g_modDir = gameDir + L"\\UIScale";
+  CreateDirectoryW((g_userDir + L"\\Logs").c_str(), nullptr);
+  LogInit(g_userDir + L"\\Logs\\UIScale.log");
+  Log("Civ V UI Scale v1 loaded into %ls", exeName.c_str());
+
+  InstallCrashLogger();
+  LoadConfig();
+  bool core = InstallCore();
+  InstallLuaBridge();  // also when inactive, so the options UI can say so
+  if (core) {
+    std::vector<std::wstring> roots = {g_modDir + L"\\Override"};
+    // Hi-res font atlases (tools/fontgen.py): 2x up to 250 %, 3x above.
+    float s = ConfiguredScale();
+    if (g_cfg.crispFonts && s >= 1.25f) {
+      const wchar_t* k = s > 2.5f ? L"x3" : L"x2";
+      roots.push_back(g_modDir + L"\\Fonts\\" + k);
+      Log("crisp fonts: using %ls atlases for scale %.2f", k, s);
+    }
+    InstallFileRedirect(gameDir, roots);
+  }
+  if (core) InstallD3DHooks();
+  if (core && g_cfg.strategicViewFix) InstallStrategicFix(GetCurrentThreadId());  // DllMain runs on the main thread
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
+  if (reason == DLL_PROCESS_DETACH) {
+    Log("process detach");
+  } else if (reason == DLL_PROCESS_ATTACH) {
+    DisableThreadLibraryCalls(inst);
+    if (!LoadRealVersionDll()) return FALSE;
+    Init();
+  }
+  return TRUE;
+}

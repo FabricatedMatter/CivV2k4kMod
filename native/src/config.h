@@ -1,0 +1,23 @@
+#pragma once
+#include <string>
+
+namespace uis {
+
+struct Config {
+  // 0 = automatic (real height / 1080), otherwise an explicit factor.
+  float scale = 0.0f;
+  float minScale = 0.5f;
+  float maxScale = 4.0f;
+  bool crispFonts = true;
+  // Align world anchors in strategic view (costs some FPS in that view only).
+  bool strategicViewFix = true;
+  bool logMouse = false;
+};
+
+extern Config g_cfg;
+extern std::wstring g_userDir;  // ...\My Games\Sid Meier's Civilization 5
+extern std::wstring g_modDir;   // <game dir>\UIScale
+
+void LoadConfig();
+void SaveConfig();
+}  // namespace uis

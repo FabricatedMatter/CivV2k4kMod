@@ -1,0 +1,4 @@
+native/build/
+__pycache__/
+native/test/*.exe
+build/
