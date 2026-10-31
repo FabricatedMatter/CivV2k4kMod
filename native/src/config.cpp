@@ -27,6 +27,7 @@ void LoadConfig() {
   g_cfg.maxScale = ReadFloat(L"MaxScale", 4.0f);
   g_cfg.crispFonts = ReadFloat(L"CrispFonts", 1.0f) != 0.0f;
   g_cfg.logMouse = ReadFloat(L"LogMouse", 0.0f) != 0.0f;
+  g_cfg.aiArt = ReadFloat(L"AIArt", 1.0f) != 0.0f;
   g_cfg.strategicViewFix = ReadFloat(L"StrategicViewFix", 1.0f) != 0.0f;
 }
 

@@ -36,6 +36,11 @@ python3 -I "$HERE/tools/fontgen.py" "$GAME" "$HERE/build/Fonts" ${TTF:+--ttf "$T
 rm -rf "$GAME/UIScale"
 cp -r "$HERE/mod" "$GAME/UIScale"
 cp -r "$HERE/build/Fonts" "$GAME/UIScale/Fonts"
+# AI-upscaled UI art, if built (tools/uiart.py)
+if [[ -d "$HERE/build/UIArt" ]]; then
+  mkdir -p "$GAME/UIScale/UIArt"
+  cp -r "$HERE/build/UIArt/x2" "$HERE/build/UIArt/x3" "$GAME/UIScale/UIArt/"
+fi
 
 echo "Installed to: $GAME"
 echo

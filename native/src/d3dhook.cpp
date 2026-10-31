@@ -236,6 +236,111 @@ using CreateWindowExAFn = HWND(WINAPI*)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, 
                                         HMENU, HINSTANCE, LPVOID);
 
 
+// ------------------------------------------------- AI-upscaled UI art
+// tools/uiart.py writes UIArt/x<k>/uiart.txt: <fnv64 mip0> <w> <h> <k> <file>.
+// Textures uploaded with matching pixels are replaced by the k x version; the
+// UI samples with normalized UVs, so the layout is unchanged.
+using CreateTex2DFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*,
+                                                   const D3D11_SUBRESOURCE_DATA*,
+                                                   ID3D11Texture2D**);
+constexpr int kVtCreateTex2D = 5;  // ID3D11Device::CreateTexture2D
+CreateTex2DFn g_origCreateTex2D = nullptr;
+
+struct ArtEntry {
+  uint32_t w, h, k;
+  std::wstring file;
+};
+std::unordered_map<uint64_t, ArtEntry> g_art;
+std::unordered_set<uint64_t> g_artSizes;  // (w << 32 | h) quick reject
+int g_artReplaced = 0, g_artMisses = 0;
+
+void LoadArtManifest(const wchar_t* k) {
+  std::wstring dir = g_modDir + L"\\UIArt\\" + k + L"\\";
+  FILE* f = _wfopen((dir + L"uiart.txt").c_str(), L"r");
+  if (!f) return;
+  char hash[32], file[260];
+  unsigned w, h, kk;
+  while (fscanf(f, "%31s %u %u %u %259s", hash, &w, &h, &kk, file) == 5) {
+    wchar_t wf[260];
+    MultiByteToWideChar(CP_UTF8, 0, file, -1, wf, 260);
+    g_art[strtoull(hash, nullptr, 16)] = ArtEntry{w, h, kk, dir + wf};
+    g_artSizes.insert(((uint64_t)w << 32) | h);
+  }
+  fclose(f);
+  Log("AI-upscaled UI art: %u textures (%ls)", (unsigned)g_art.size(), k);
+}
+
+uint64_t HashMip0(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* init) {
+  uint64_t h = 0xCBF29CE484222325ull;
+  auto p = static_cast<const uint8_t*>(init->pSysMem);
+  size_t row = (size_t)d->Width * 4;
+  for (UINT y = 0; y < d->Height; ++y) {
+    const uint8_t* r = p + (size_t)y * init->SysMemPitch;
+    for (size_t x = 0; x < row; ++x) h = (h ^ r[x]) * 0x100000001B3ull;
+  }
+  return h;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC* d,
+                                          const D3D11_SUBRESOURCE_DATA* init,
+                                          ID3D11Texture2D** out) {
+  if (d && init && init->pSysMem && out && d->ArraySize == 1 &&
+      (d->Format == DXGI_FORMAT_B8G8R8A8_UNORM || d->Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+       d->Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+      g_artSizes.count(((uint64_t)d->Width << 32) | d->Height)) {
+    uint64_t h = HashMip0(d, init);
+    auto it = g_art.find(h);
+    if (it == g_art.end()) {
+      if (g_artMisses++ < 20)
+        Log("UI art candidate %ux%u fmt %d hash %016llx: no match", d->Width, d->Height,
+            (int)d->Format, (unsigned long long)h);
+    } else {
+      FILE* f = _wfopen(it->second.file.c_str(), L"rb");
+      std::vector<uint8_t> buf;
+      if (f) {
+        fseek(f, 0, SEEK_END);
+        buf.resize(ftell(f));
+        fseek(f, 0, SEEK_SET);
+        if (fread(buf.data(), 1, buf.size(), f) != buf.size()) buf.clear();
+        fclose(f);
+      }
+      if (buf.size() > 128) {
+        uint32_t fh, fw, fm;
+        memcpy(&fh, &buf[12], 4);
+        memcpy(&fw, &buf[16], 4);
+        memcpy(&fm, &buf[28], 4);
+        D3D11_TEXTURE2D_DESC hd = *d;
+        hd.Width = fw;
+        hd.Height = fh;
+        UINT levels = d->MipLevels ? d->MipLevels : fm;
+        if (levels > fm) levels = fm;
+        hd.MipLevels = levels;
+        std::vector<D3D11_SUBRESOURCE_DATA> sub(levels);
+        size_t off = 128;
+        bool ok = true;
+        for (UINT i = 0; i < levels; ++i) {
+          UINT lw = fw >> i ? fw >> i : 1, lh = fh >> i ? fh >> i : 1;
+          if (off + (size_t)lw * lh * 4 > buf.size()) ok = false;
+          sub[i] = {buf.data() + off, lw * 4, 0};
+          off += (size_t)lw * lh * 4;
+        }
+        if (ok) {
+          if (d->Format == DXGI_FORMAT_R8G8B8A8_UNORM)  // files are BGRA
+            hd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+          HRESULT hr = g_origCreateTex2D(dev, &hd, sub.data(), out);
+          if (SUCCEEDED(hr)) {
+            if (++g_artReplaced <= 5 || g_artReplaced % 25 == 0)
+              Log("UI art replaced #%d: %ux%u -> %ux%u", g_artReplaced, d->Width, d->Height, fw, fh);
+            return hr;
+          }
+          Log("UI art texture creation failed 0x%08lx", (unsigned long)hr);
+        }
+      }
+    }
+  }
+  return g_origCreateTex2D(dev, d, init, out);
+}
+
 constexpr int kVtCreatePS = 15;    // ID3D11Device::CreatePixelShader
 constexpr int kVtPSSetShader = 9;  // ID3D11DeviceContext::PSSetShader
 constexpr int kVtPSSetCB = 16;     // ID3D11DeviceContext::PSSetConstantBuffers
@@ -363,6 +468,13 @@ void HookD3DVtables() {
   }
   PatchVt(*reinterpret_cast<void***>(dev), kVtCreatePS, (void*)&HookCreatePS,
           reinterpret_cast<void**>(&g_origCreatePS));
+  float s = ConfiguredScale();
+  if (g_cfg.aiArt && s >= 1.25f) {
+    LoadArtManifest(s > 2.5f ? L"x3" : L"x2");
+    if (!g_art.empty())
+      PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
+              reinterpret_cast<void**>(&g_origCreateTex2D));
+  }
 
   if (imm) HookContextVt(imm);
   ID3D11DeviceContext* def = nullptr;

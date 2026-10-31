@@ -9,6 +9,7 @@ struct Config {
   float minScale = 0.5f;
   float maxScale = 4.0f;
   bool crispFonts = true;
+  bool aiArt = true;  // AI-upscaled UI textures (tools/uiart.py)
   // Align world anchors in strategic view (costs some FPS in that view only).
   bool strategicViewFix = true;
   bool logMouse = false;
