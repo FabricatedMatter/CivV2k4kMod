@@ -402,3 +402,40 @@ def ring_upscale(pm, k, ss=8):
     alpha = hi[..., 3] + cov
     rgb = hi[..., :3] + cov[..., None] * color[None, None, :]
     return np.clip(np.dstack([rgb, alpha]), 0, 1), (cx, cy, r, sw)
+
+
+# ------------------------------------------------------------------ single-colour masks
+def is_mask(rgba8):
+    """Constant colour, shape only in alpha (white symbol atlases tinted by the game)."""
+    a = rgba8[..., 3]
+    vis = a > 32
+    if vis.sum() < 16 or a.min() == a.max():
+        return False
+    if float(rgba8[..., :3][vis].std(axis=0).max()) >= 4.0:
+        return False
+    # pure two-level shapes only: partial alpha must sit on the edge (next to both a
+    # transparent and an opaque pixel); interior shading (unit flags) needs the AI path
+    lo = ndimage.binary_dilation(a < 40, np.ones((3, 3), bool))
+    hi = ndimage.binary_dilation(a > 215, np.ones((3, 3), bool))
+    mid = (a >= 40) & (a <= 215)
+    interior = mid & ~lo  # shading inside the shape, away from any transparent pixel
+    del hi
+    return interior.sum() <= 0.02 * vis.sum()
+
+
+def mask_upscale(rgba8, k, ss=4):
+    """Crisp vector-like upscale of an alpha mask: smooth (bicubic) upsampling to
+    k*ss, threshold at the 50 % edge, box down to k (anti-aliased edges), then the
+    coverage-weighted projection so stroke weights match the original exactly."""
+    from PIL import Image
+    h, w = rgba8.shape[:2]
+    a = rgba8[..., 3]
+    big = np.asarray(Image.fromarray(a).resize((w * k * ss, h * k * ss), Image.BICUBIC),
+                     np.float32) / 255
+    cov = (big >= 0.5).astype(np.float32).reshape(h * k, ss, w * k, ss).mean(axis=(1, 3))
+    vis = a > 32
+    color = rgba8[..., :3][vis].mean(axis=0) / 255 if vis.any() else np.ones(3)
+    hi = np.dstack([cov[..., None] * color[None, None, :], cov])
+    pm = premul(rgba8)
+    pm[..., :3] = pm[..., 3:4] * color[None, None, :]  # colour of transparent pixels is noise
+    return project(hi.astype(np.float32), pm, k)

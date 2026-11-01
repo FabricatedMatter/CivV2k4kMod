@@ -21,6 +21,8 @@ Methods (chosen per texture by METHODS, first matching prefix wins):
   ai       Real-ESRGAN-ncnn 4x (default model: Remacri), resampled to k x and then
            projected so it averages back to the original exactly (ornaments, diagonals)
   lanczos  plain resampling (soft glows, where any sharpening would be wrong)
+  mask     single-colour alpha masks (white symbol atlases): smooth upsampling, 50 % edge,
+           anti-aliased and projected to the original coverage
   ring     tools/uirecon.py: thin half-circle strokes tangent to straight lines, fitted
            and redrawn analytically (city banner outlines)
 """
@@ -81,6 +83,8 @@ CATEGORY_DEFAULT = {"frames": "box", "banners": "ai", "resources": "ai", "fontic
                     "atlases": "ai", "compressed": "ai"}
 # Per-texture method, by name prefix (first match wins); everything else: box.
 METHODS = (
+    # white symbol masks tinted by the game (auto-detection misses the small sizes)
+    ("religioussymbolswhite", "mask"),
     # banners: straight / rounded 9-slice pieces and plain glows
     ("buttonsidesglow", "lanczos"), ("citybannerbuttonglow", "lanczos"),
     # round banner pieces (half discs, pill ends, arcs): box approximates the arcs with
@@ -418,6 +422,8 @@ def render(method, orig, k, ai4=None, fits=None):
     if method == "box":
         hi, fits = uirecon.box_upscale(pm, k, radii=fits and [f for _, f in fits])
         return uirecon.unpremul(hi), fits
+    if method == "mask":
+        return uirecon.unpremul(uirecon.mask_upscale(orig, k)), None
     if method == "ring":
         return uirecon.unpremul(uirecon.ring_upscale(pm, k)[0]), None
     if method == "ai":
@@ -462,13 +468,17 @@ def main():
                                                      "upscaler", "pkg", "realesrgan-ncnn-vulkan"))
     ap.add_argument("--model", default="remacri-4x")
     ap.add_argument("--only", help="regex: restrict to matching texture names")
-    ap.add_argument("--force-method", choices=["box", "axis", "ai", "lanczos", "ring"])
+    ap.add_argument("--force-method", choices=["box", "axis", "ai", "lanczos", "ring", "mask"])
     ap.add_argument("--list", action="store_true", help="only list textures and methods")
+    ap.add_argument("--only-method", help="restrict to textures assigned this method")
+    ap.add_argument("--scales", default="2,3", help="output scales, e.g. 2 or 2,3")
     ap.add_argument("--resume", action="store_true",
                     help="skip textures whose outputs already exist in OUT_DIR")
     ap.add_argument("--max-size", type=int, default=1024,
                     help="skip textures whose (assembled) image is larger than this")
     a = ap.parse_args()
+    global SCALES
+    SCALES = tuple(int(x) for x in a.scales.split(","))
 
     rx = re.compile(a.only) if a.only else None
     # Base game, G&K, BNW, patches and DLC each ship their own versions of many UI
@@ -525,6 +535,12 @@ def main():
         items.append(it)
     default = CATEGORY_DEFAULT.get(a.category, "box")
     methods = [a.force_method or method_for(it["name"], default) for it in items]
+    # single-colour masks (white symbol atlases): exact mask upscale instead of AI
+    methods = [("mask" if not a.force_method and m == "ai" and uirecon.is_mask(it["src"]) else m)
+               for it, m in zip(items, methods)]
+    if a.only_method:
+        keep = [i for i, m in enumerate(methods) if m == a.only_method]
+        items, methods = [items[i] for i in keep], [methods[i] for i in keep]
     print("%s: %d textures, %d of them tile sprites (%s)" % (
         a.category, len(items), sum(it["index"] is not None for it in items),
         ", ".join("%s %d" % (m, methods.count(m)) for m in ("box", "axis", "ai", "lanczos"))))

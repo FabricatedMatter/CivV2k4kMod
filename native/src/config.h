@@ -17,6 +17,7 @@ struct Config {
   bool dumpPixels = false;
   // Experimental: render the map overlay pages (borders, fog) at N x resolution.
   int overlayScale = 0;
+  bool overlayDiag = false;  // DumpTextures=3: log overlay page usage
 };
 
 extern Config g_cfg;

@@ -567,6 +567,14 @@ void DumpTexture(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* in
 // while one is bound is scaled by N; sampling uses normalized UVs, so nothing else moves.
 std::unordered_set<void*> g_overlayRT;
 SRWLOCK g_overlayLock = SRWLOCK_INIT;
+bool IsOverlayRT(const D3D11_TEXTURE2D_DESC* d);
+bool DescOf(ID3D11Resource* r, D3D11_TEXTURE2D_DESC* d);
+// Only the 256^2 map-tile pages are scaled: they are drawn without a depth buffer (two
+// pages at a time). The 1024^2 / 2048^2 pages (fog / map wide, the latter with its own
+// depth buffer) stay as they are.
+bool IsScaledOverlay(const D3D11_TEXTURE2D_DESC* d) {
+  return IsOverlayRT(d) && d->Width == 256;
+}
 bool IsOverlayRT(const D3D11_TEXTURE2D_DESC* d) {
   return d->Width == d->Height && (d->Width == 256 || d->Width == 1024 || d->Width == 2048) &&
          d->ArraySize == 1 && d->Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
@@ -578,7 +586,7 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
                                           const D3D11_SUBRESOURCE_DATA* init,
                                           ID3D11Texture2D** out) {
   if (g_cfg.dumpPixels && d && init && init->pSysMem && d->ArraySize == 1) DumpTexture(d, init);
-  if (g_cfg.overlayScale && d && !init && IsOverlayRT(d)) {
+  if (g_cfg.overlayScale && d && !init && IsScaledOverlay(d)) {
     D3D11_TEXTURE2D_DESC sd = *d;
     UINT f = (UINT)g_cfg.overlayScale;
     sd.Width *= f;
@@ -979,10 +987,33 @@ void STDMETHODCALLTYPE HookOMSetRT(ID3D11DeviceContext* c, UINT n,
           D3D11_TEXTURE2D_DESC base = td;
           base.Width /= f;
           base.Height /= f;
-          if (td.Width % f == 0 && IsOverlayRT(&base)) sc = (float)f;
+          if (td.Width % f == 0 && IsScaledOverlay(&base)) sc = (float)f;
         }
       }
       r->Release();
+    }
+  }
+  if (sc > 1.0f) {  // every target bound with a scaled page must have its size
+    static int warned = 0;
+    D3D11_TEXTURE2D_DESC d0 = {};
+    ID3D11Resource* r0 = nullptr;
+    rtv[0]->GetResource(&r0);
+    if (r0) {
+      DescOf(r0, &d0);
+      r0->Release();
+    }
+    for (UINT i = 1; i < n + 1 && warned < 10; ++i) {
+      ID3D11Resource* r = nullptr;
+      if (i < n && rtv[i]) rtv[i]->GetResource(&r);
+      if (i == n && dsv) dsv->GetResource(&r);
+      D3D11_TEXTURE2D_DESC di = {};
+      if (r && DescOf(r, &di) && di.Width != d0.Width) {
+        ++warned;
+        Log("overlay size mismatch: page %ux%u bound with %s %ux%u fmt %d bind 0x%x misc 0x%x",
+            d0.Width, d0.Height, i == n ? "depth" : "target", di.Width, di.Height,
+            (int)di.Format, di.BindFlags, di.MiscFlags);
+      }
+      if (r) r->Release();
     }
   }
   if (sc != g_rtScale[S]) {
@@ -1029,6 +1060,93 @@ void STDMETHODCALLTYPE HookRSSetSci(ID3D11DeviceContext* c, UINT n, const D3D11_
   g_origRSSetSci[S](c, g_lastScin[S], t);
 }
 
+// ---- overlay diagnostics (DumpTextures=3): how are the overlay pages used?
+constexpr int kVtCopySubRegion = 46, kVtCopyResource = 47;
+using CopySubRegionFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT,
+                                                  UINT, UINT, UINT, ID3D11Resource*, UINT,
+                                                  const D3D11_BOX*);
+using CopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
+                                                 ID3D11Resource*);
+CopySubRegionFn g_origCopySub[2] = {};
+CopyResourceFn g_origCopyRes[2] = {};
+OMSetRTFn g_origOMSetRTDiag[2] = {};
+int g_ovDiag = 0;
+
+bool DescOf(ID3D11Resource* r, D3D11_TEXTURE2D_DESC* d) {
+  if (!r) return false;
+  D3D11_RESOURCE_DIMENSION dim;
+  r->GetType(&dim);
+  if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return false;
+  static_cast<ID3D11Texture2D*>(r)->GetDesc(d);
+  return true;
+}
+bool IsOverlayRes(ID3D11Resource* r) {
+  D3D11_TEXTURE2D_DESC d;
+  return DescOf(r, &d) && IsOverlayRT(&d);
+}
+void LogRes(const char* what, ID3D11Resource* r) {
+  D3D11_TEXTURE2D_DESC d = {};
+  if (DescOf(r, &d))
+    Log("  %s %ux%u fmt %d mips %u bind 0x%x misc 0x%x usage %d", what, d.Width, d.Height,
+        (int)d.Format, d.MipLevels, d.BindFlags, d.MiscFlags, (int)d.Usage);
+  else
+    Log("  %s (not a 2D texture)", what);
+}
+
+template <int S>
+void STDMETHODCALLTYPE DiagCopySub(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x,
+                                   UINT y, UINT z, ID3D11Resource* src, UINT ss,
+                                   const D3D11_BOX* box) {
+  if (g_ovDiag < 400 && (IsOverlayRes(dst) || IsOverlayRes(src))) {
+    ++g_ovDiag;
+    Log("ovl CopySubresourceRegion ctx%d dst sub %u at %u,%u src sub %u box %s", S, ds, x, y, ss,
+        box ? "yes" : "full");
+    LogRes("dst", dst);
+    LogRes("src", src);
+  }
+  g_origCopySub[S](c, dst, ds, x, y, z, src, ss, box);
+}
+template <int S>
+void STDMETHODCALLTYPE DiagCopyRes(ID3D11DeviceContext* c, ID3D11Resource* dst,
+                                   ID3D11Resource* src) {
+  if (g_ovDiag < 400 && (IsOverlayRes(dst) || IsOverlayRes(src))) {
+    ++g_ovDiag;
+    Log("ovl CopyResource ctx%d", S);
+    LogRes("dst", dst);
+    LogRes("src", src);
+  }
+  g_origCopyRes[S](c, dst, src);
+}
+template <int S>
+void STDMETHODCALLTYPE DiagOMSetRT(ID3D11DeviceContext* c, UINT n,
+                                   ID3D11RenderTargetView* const* rtv,
+                                   ID3D11DepthStencilView* dsv) {
+  if (g_ovDiag < 400 && n && rtv && rtv[0]) {
+    ID3D11Resource* r = nullptr;
+    rtv[0]->GetResource(&r);
+    if (r && IsOverlayRes(r)) {
+      static std::unordered_set<uint64_t> seen;
+      D3D11_TEXTURE2D_DESC rd, dd = {};
+      DescOf(r, &rd);
+      ID3D11Resource* dr = nullptr;
+      if (dsv) dsv->GetResource(&dr);
+      if (dr) DescOf(dr, &dd);
+      D3D11_RENDER_TARGET_VIEW_DESC vd;
+      rtv[0]->GetDesc(&vd);
+      uint64_t key = ((uint64_t)rd.Width << 40) | ((uint64_t)dd.Width << 20) |
+                     ((uint64_t)vd.Texture2D.MipSlice << 8) | n;
+      if (seen.insert(key).second) {
+        ++g_ovDiag;
+        Log("ovl RT bound ctx%d: %ux%u mip %u (%u RTVs) dsv %s %ux%u fmt %d", S, rd.Width,
+            rd.Height, vd.Texture2D.MipSlice, n, dsv ? "yes" : "none", dd.Width, dd.Height,
+            (int)dd.Format);
+      }
+      if (dr) dr->Release();
+    }
+    if (r) r->Release();
+  }
+  g_origOMSetRTDiag[S](c, n, rtv, dsv);
+}
 void HookContextVt(ID3D11DeviceContext* ctx) {
   void** vt = *reinterpret_cast<void***>(ctx);
   if (g_ctxVt[0] == vt || g_ctxVt[1] == vt) return;
@@ -1046,6 +1164,15 @@ void HookContextVt(ID3D11DeviceContext* ctx) {
             reinterpret_cast<void**>(&g_origRSSetVP[slot]));
     PatchVt(vt, kVtRSSetScissor, slot == 0 ? (void*)&HookRSSetSci<0> : (void*)&HookRSSetSci<1>,
             reinterpret_cast<void**>(&g_origRSSetSci[slot]));
+  }
+  if (g_cfg.overlayDiag) {
+    PatchVt(vt, kVtCopySubRegion, slot == 0 ? (void*)&DiagCopySub<0> : (void*)&DiagCopySub<1>,
+            reinterpret_cast<void**>(&g_origCopySub[slot]));
+    PatchVt(vt, kVtCopyResource, slot == 0 ? (void*)&DiagCopyRes<0> : (void*)&DiagCopyRes<1>,
+            reinterpret_cast<void**>(&g_origCopyRes[slot]));
+    if (!g_cfg.overlayScale)
+      PatchVt(vt, kVtOMSetRT, slot == 0 ? (void*)&DiagOMSetRT<0> : (void*)&DiagOMSetRT<1>,
+              reinterpret_cast<void**>(&g_origOMSetRTDiag[slot]));
   }
   if (g_cfg.dumpTextures) {
     PatchVt(vt, kVtPSSetSRV, slot == 0 ? (void*)&HookPSSetSRV<0> : (void*)&HookPSSetSRV<1>,

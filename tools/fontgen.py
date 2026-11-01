@@ -95,16 +95,50 @@ def render_ttf_base(ttf, size, k, ggxml, fallback):
     return out / 255.0
 
 
+def _near_distance(mask, radius):
+    """Euclidean distance from each pixel to the nearest True pixel of mask, exact up to
+    radius (larger distances come back as radius + 1). numpy only."""
+    R = int(np.ceil(radius))
+    h, w = mask.shape
+    p = np.pad(mask, R)
+    d = np.full(mask.shape, radius + 1.0, np.float32)
+    for dy in range(-R, R + 1):
+        for dx in range(-R, R + 1):
+            r = (dx * dx + dy * dy) ** 0.5
+            if r <= radius:
+                hit = p[R + dy:R + dy + h, R + dx:R + dx + w]
+                d = np.where(hit & (d > r), np.float32(r), d)
+    return d
+
+
+def _gaussian(img, sigma, truncate=4.0):
+    """Separable Gaussian blur with reflected edges (= scipy.ndimage.gaussian_filter)."""
+    r = int(truncate * sigma + 0.5)
+    x = np.arange(-r, r + 1, dtype=np.float64)
+    kern = np.exp(-0.5 * (x / sigma) ** 2)
+    kern /= kern.sum()
+    out = img.astype(np.float64)
+    for axis in (0, 1):
+        pad = [(r, r) if a == axis else (0, 0) for a in (0, 1)]
+        p = np.pad(out, pad, mode="symmetric")
+        acc = np.zeros_like(out)
+        n = out.shape[axis]
+        for i, wgt in enumerate(kern):
+            acc += wgt * (p[i:i + n] if axis == 0 else p[:, i:i + n])
+        out = acc
+    return out.astype(np.float32)
+
+
 def derive_layer(kind, base, k):
-    from scipy import ndimage
     if kind == "stroke":
-        d = ndimage.distance_transform_edt(base < 0.5)
+        reach = STROKE_RADIUS * k + 0.5  # beyond this the stroke is fully transparent
+        d = _near_distance(base >= 0.5, reach + 1)
         return np.clip(STROKE_RADIUS * k - d + 0.5, 0, 1)
     if kind == "shadow":
         dx, dy = SHADOW_OFFSET
         return np.maximum(base, np.roll(np.roll(base, dy * k, 0), dx * k, 1))
     if kind == "soft":
-        return np.maximum(base, np.clip(ndimage.gaussian_filter(base, SOFT_SIGMA * k) * SOFT_GAIN, 0, 1))
+        return np.maximum(base, np.clip(_gaussian(base, SOFT_SIGMA * k) * SOFT_GAIN, 0, 1))
     return base
 
 

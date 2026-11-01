@@ -1,7 +1,6 @@
-"""BC1 (DXT1) / BC3 (DXT5) decoding with numpy, and encoding via ImageMagick."""
+"""BC1 (DXT1) / BC3 (DXT5) decoding with numpy, and encoding via Pillow."""
 import os
 import struct
-import subprocess
 import tempfile
 
 import numpy as np
@@ -82,8 +81,7 @@ def decode(w, h, kind, raw):
 
 def encode_dds(path, rgba, kind):
     """Writes rgba as a BC1/BC3 DDS with a full mip chain: levels are box-filtered here
-    and each is block-compressed by ImageMagick (which skips mips for non-power-of-two
-    sizes on its own)."""
+    and each is block-compressed by Pillow."""
     h, w = rgba.shape[:2]
     levels = [rgba]
     while levels[-1].shape[0] > 1 or levels[-1].shape[1] > 1:
@@ -91,19 +89,17 @@ def encode_dds(path, rgba, kind):
         levels.append(np.asarray(Image.fromarray(cur, "RGBA").resize(
             (max(1, cur.shape[1] // 2), max(1, cur.shape[0] // 2)), Image.BOX)))
     blobs = []
+    bs = 8 if kind == "dxt1" else 16
     with tempfile.TemporaryDirectory() as td:
         for i, lv in enumerate(levels):
-            src, dst = os.path.join(td, "%d.png" % i), os.path.join(td, "%d.dds" % i)
-            Image.fromarray(lv, "RGBA").save(src)
-            subprocess.run(["magick", src, "-define", "dds:compression=" + kind,
-                            "-define", "dds:cluster-fit=true", "-define", "dds:mipmaps=0", dst],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            dst = os.path.join(td, "%d.dds" % i)
+            # Pillow's built-in BC1/BC3 encoder (fast; no external tools)
+            Image.fromarray(lv, "RGBA").save(dst, pixel_format=kind.upper())
             d = open(dst, "rb").read()
             lw, lh = lv.shape[1], lv.shape[0]
-            size = max(1, (lw + 3) // 4) * max(1, (lh + 3) // 4) * (8 if kind == "dxt1" else 16)
+            size = max(1, (lw + 3) // 4) * max(1, (lh + 3) // 4) * bs
             blobs.append(d[128:128 + size])
     hdr = bytearray(128)
-    bs = 8 if kind == "dxt1" else 16
     struct.pack_into("<4sIIIIIII", hdr, 0, b"DDS ", 124, 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000,
                      h, w, max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * bs, 0, len(levels))
     struct.pack_into("<II4s", hdr, 76, 32, 0x4, kind.upper().encode())
