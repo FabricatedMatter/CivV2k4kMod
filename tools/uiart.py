@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""AI upscaling workflow for Civ V UI textures.
+"""Hi-res UI art for Civ V: geometric reconstruction where the art is geometric,
+local AI upscaling where it is not.
 
-  uiart.py build  GAME_DIR OUT_DIR --category frames [--upscaler esrgan|lanczos]
-                  [--esrgan PATH_TO_realesrgan-ncnn-vulkan] [--model realesrgan-x4plus-anime]
+  uiart.py merge  OUT_DIR PART_DIR...   (fold parallel category builds into OUT_DIR)
+  uiart.py build  GAME_DIR OUT_DIR --category frames [--esrgan PATH] [--model remacri-4x]
+                  [--only REGEX] [--force-method box|axis|ai|lanczos]
   -> OUT_DIR/x<k>/<name>_x<k>.dds   hi-res BGRA DDS with full mip chain
      OUT_DIR/x<k>/uiart.txt         manifest for the DLL:
                                      <fnv64 of original mip0> <w> <h> <k> <file>
@@ -11,6 +13,16 @@
 
 The DLL swaps textures on upload (matched by hash) and the UI's normalized UVs make
 the k x texture line up exactly with the original layout.
+
+Methods (chosen per texture by METHODS, first matching prefix wins):
+  box      tools/uirecon.py: straight bands/edges re-rendered sharp + fitted rounded
+           corners re-rendered as true arcs (9-slice panels, buttons, frames)
+  axis     tools/uirecon.py without corners (trims, bars, square frames, fills)
+  ai       Real-ESRGAN-ncnn 4x (default model: Remacri), resampled to k x and then
+           projected so it averages back to the original exactly (ornaments, diagonals)
+  lanczos  plain resampling (soft glows, where any sharpening would be wrong)
+  ring     tools/uirecon.py: thin half-circle strokes tangent to straight lines, fitted
+           and redrawn analytically (city banner outlines)
 """
 import argparse
 import os
@@ -18,6 +30,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 import numpy as np
 from PIL import Image
@@ -25,6 +38,9 @@ from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fpk  # noqa: E402
+import uirecon  # noqa: E402
+import uisprite  # noqa: E402
+import bcn  # noqa: E402
 
 CATEGORIES = {
     # Stage 1: frames, borders, separators, scroll bars and other window chrome.
@@ -35,7 +51,76 @@ CATEGORIES = {
         "bar400x2", "bar500x2", "bar900x2", "connect_", "selectedup", "selecteddown",
         "blankbutton", "newx",
     ),
+    # Stage 2: city banners, button backgrounds, top panel, window buttons.
+    "banners": (
+        "citybanner", "citystatemeter", "garrisonframe", "citybombard", "buttonsides",
+        "toppanel", "closeminbuttons", "civilopediatopbuttons", "civilopediasidebuttons",
+        "civilopediabuttons", "64x64framebuttons", "45x45framebutton", "actionitemsbutton",
+        "buttons_", "listbutton", "mainstrategicbutton", "maintechbutton", "unitactionbutton",
+        "buttonmask", "oversupplylimit",
+    ),
 }
+# Icon atlases (painted art: AI). Stage 3.
+CATEGORIES.update({
+    "resources": ("resource",),
+    "fonticons": ("fonticon",),
+    "units": ("unitportrait", "unit_", "unitflag", "unitaction"),
+    "civs": ("civsymbol", "religioussymbol"),
+    # everything else in the UI archives (buildings, wonders, leaders, religion, policies,
+    # tech tree, notifications, ...)
+    "rest": (),
+    # icon / portrait atlases named in IconTextureAtlases XML (buildings, wonders,
+    # leaders, techs, policies, promotions, ...)
+    "atlases": (),
+    # BC1/BC3-compressed UI art (wonder concept art, advisors, leader screens, ...)
+    "compressed": (),
+})
+# Method for textures no METHODS prefix matches.
+CATEGORY_DEFAULT = {"frames": "box", "banners": "ai", "resources": "ai", "fonticons": "ai",
+                    "units": "ai", "civs": "ai", "rest": "ai",
+                    "atlases": "ai", "compressed": "ai"}
+# Per-texture method, by name prefix (first match wins); everything else: box.
+METHODS = (
+    # banners: straight / rounded 9-slice pieces and plain glows
+    ("buttonsidesglow", "lanczos"), ("citybannerbuttonglow", "lanczos"),
+    # round banner pieces (half discs, pill ends, arcs): box approximates the arcs with
+    # visible steps; AI keeps them round
+    ("citybannerframeleft", "ring"), ("citybannerframeright", "ring"),
+    ("buttonsides", "ai"), ("citybannerframe", "axis"), ("citybannerbackground", "box"),
+    ("citybannerleftbackground", "ai"), ("citybannerrightbackground", "ai"),
+    ("citybannerbuttonbase", "ai"), ("citybannerstrengthback", "ai"),
+    ("citybannergrowth", "ai"), ("citybannerproductionbackground", "ai"),
+    ("citystatemeterbase", "box"), ("citystatemeterblack", "box"), ("toppanelbar", "axis"),
+    ("listbutton", "box"),
+    # ornaments with diagonals and arcs: no axis-aligned structure to reconstruct
+    ("dec32x64", "ai"), ("dectop", "ai"), ("corner16", "ai"), ("newx", "ai"),
+    ("slider32", "ai"), ("selectedup", "ai"), ("selecteddown", "ai"),
+    ("grid9detail140", "ai"), ("grid9detailtwo140", "ai"), ("grid9detailthree140", "ai"),
+    ("grid9detailfour140", "ai"), ("grid9detailfive140", "ai"), ("grid9detailsix140", "ai"),
+    ("grid9frame8fade", "ai"),
+    # soft glows: band-limited by design
+    ("windowhlgrid27", "lanczos"), ("grid9frameredhl", "lanczos"),
+    ("grid9frameturnshl", "lanczos"), ("glassback", "lanczos"),
+    # straight structure only
+    ("bar300x2", "axis"), ("bar340x2", "axis"), ("bar400x2", "axis"), ("bar500x2", "axis"),
+    ("bar900x2", "axis"), ("frametopbottom", "axis"), ("horizontaltrim", "axis"),
+    ("verticaltrim", "axis"), ("sideright", "axis"), ("scrollbar", "axis"),
+    ("gridglass", "axis"), ("gridsquare", "axis"), ("grid9listitem", "axis"),
+    ("grid9boxbuttons", "axis"), ("grid9frame27square", "axis"), ("grid9framered", "axis"),
+    ("grid9framegreenfade", "axis"), ("grid9frameturns", "axis"), ("grid9tech", "ai"),
+    ("grid9detail48", "axis"), ("dropdownbuttons", "axis"), ("windowgrid27", "axis"),
+    ("divider", "axis"), ("blankbutton", "axis"),
+)
+
+
+def method_for(name, default="box"):
+    name = name.split(".")[0]
+    for prefix, m in METHODS:
+        if name.startswith(prefix):
+            return m
+    return default
+
+
 SCALES = (2, 3)
 PAD = 8          # replicated border (1x px) so 9-slice edges stay seamless
 ESRGAN_SCALE = 4
@@ -102,9 +187,15 @@ def lanczos(img, k):
                                                          Image.LANCZOS))
 
 
+CUGAN_EXE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "upscaler",
+                         "cugan_dl", "realcugan-ncnn-vulkan-20220728-ubuntu",
+                         "realcugan-ncnn-vulkan")
+
+
 class Esrgan:
     def __init__(self, exe, model):
         self.exe, self.model = exe, model
+        # Remacri / UltraSharp come in upscayl's ncnn format; same binary, same CLI
         self.models = os.path.join(os.path.dirname(exe), "models")
 
     def run(self, images):
@@ -117,10 +208,26 @@ class Esrgan:
                 Image.fromarray(im, "RGB").save(os.path.join(ind, "%05d.png" % i))
             # one call per image: directory mode crashes the x4plus models on large batches
             for i in range(len(images)):
-                subprocess.run([self.exe, "-i", os.path.join(ind, "%05d.png" % i),
-                                "-o", os.path.join(outd, "%05d.png" % i), "-n", self.model,
-                                "-s", str(ESRGAN_SCALE), "-m", self.models, "-f", "png"],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                src, dst = os.path.join(ind, "%05d.png" % i), os.path.join(outd, "%05d.png" % i)
+                if self.model.startswith("cugan"):
+                    # cugan[:variant[:noise]]: Real-CUGAN (models-se / models-pro), 4x
+                    parts = (self.model.split(":") + ["models-se", "-1"])[1:3]
+                    exe = CUGAN_EXE
+                    cmd = [exe, "-i", src, "-o", dst, "-s", str(ESRGAN_SCALE), "-n", parts[1],
+                           "-m", os.path.join(os.path.dirname(exe), parts[0]), "-f", "png"]
+                else:
+                    cmd = [self.exe, "-i", src, "-o", dst, "-n", self.model,
+                           "-s", str(ESRGAN_SCALE), "-m", self.models, "-f", "png"]
+                gpu = os.environ.get("UIART_GPU")
+                if gpu is not None:
+                    cmd += ["-g", gpu]
+                for attempt in range(4):  # ncnn aborts when VRAM is short; retry
+                    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if r.returncode == 0 and os.path.exists(dst):
+                        break
+                    time.sleep(2 + 3 * attempt)
+                else:
+                    raise RuntimeError("upscaler failed: " + " ".join(cmd))
             return [np.asarray(Image.open(os.path.join(outd, "%05d.png" % i)).convert("RGB"))
                     for i in range(len(images))]
 
@@ -134,8 +241,14 @@ def upscale_textures(textures, up):
         rgb_out = [lanczos(x, ESRGAN_SCALE) for x in rgb_in]
         alpha_out = [lanczos(x, ESRGAN_SCALE) for x in alpha_in]
     else:
-        outs = up.run(rgb_in + alpha_in)
-        rgb_out, alpha_out = outs[:len(rgb_in)], outs[len(rgb_in):]
+        # uniform alpha (opaque art) needs no AI pass: it stays uniform
+        flat = [p[..., 3].min() == p[..., 3].max() for p in padded]
+        work = [x for x, f in zip(alpha_in, flat) if not f]
+        outs = up.run(rgb_in + work)
+        rgb_out, it = outs[:len(rgb_in)], iter(outs[len(rgb_in):])
+        alpha_out = [np.full((x.shape[0] * ESRGAN_SCALE, x.shape[1] * ESRGAN_SCALE, 3),
+                             x[0, 0, 0], np.uint8) if f else next(it)
+                     for x, f in zip(alpha_in, flat)]
     res = []
     p4 = PAD * ESRGAN_SCALE
     for t, rgb, al in zip(textures, rgb_out, alpha_out):
@@ -180,6 +293,24 @@ def metrics(orig, hi):
     return worst_psnr, alpha_mae, worst_px
 
 
+def staircase(orig, hi, k):
+    """Share of alpha-edge pixels whose k x k block in the hi-res image is uniform, i.e.
+    looks like a nearest-neighbour copy of the 1x edge. Curved edges rendered by the
+    axis/box methods without a fitted arc score high (visible stair steps)."""
+    a = orig[..., 3].astype(np.float32)
+    gy, gx = np.gradient(a)
+    # partially covered pixels on diagonal / curved edges only: straight axis-aligned
+    # edges legitimately become uniform k x k blocks
+    diag = np.minimum(np.abs(gx), np.abs(gy)) > 0.35 * np.maximum(np.abs(gx), np.abs(gy))
+    edge = (a > 20) & (a < 235) & diag & (np.hypot(gx, gy) > 20)
+    if edge.sum() < 8:
+        return 0.0
+    h, w = a.shape
+    blk = hi[..., 3].astype(np.float32).reshape(h, k, w, k)
+    spread = blk.max(axis=(1, 3)) - blk.min(axis=(1, 3))
+    return float((spread[edge] < 8).mean())
+
+
 def checker(h, w, cell=8):
     y, x = np.mgrid[0:h, 0:w]
     c = (((y // cell) + (x // cell)) % 2) * 40 + 90
@@ -218,69 +349,254 @@ def contact_sheet(rows, path_base, k, per_page=24, max_w=160):
 
 
 # ------------------------------------------------------------------ main
+UI_ARCHIVES = {"uitextures": "", "expansion1uitextures": "e1", "expansion2uitextures": "e2"}
+
+
+def load_sources(game):
+    """[(tag, name, off, size, data)] from every DX9 texture archive plus loose DDS files
+    under Assets/**/UI/. tag: "" / e1 / e2 for the three UI archives, the archive name
+    for other archives, "loose-<dir>" for loose files. UI archives are flagged by is_ui()."""
+    import glob
+    out = []
+    for path in sorted(glob.glob(os.path.join(game, "Resource", "DX9", "*.fpk"))):
+        base = os.path.basename(path).lower()[:-4]
+        tag = UI_ARCHIVES.get(base, base.replace("textures", ""))
+        out += [(tag,) + e for e in fpk.entries(path)]
+    for path in sorted(glob.glob(os.path.join(game, "Assets", "**", "*.dds"), recursive=True)):
+        rel = os.path.relpath(path, os.path.join(game, "Assets")).replace(os.sep, "/")
+        if "/UI/" not in "/" + rel or "/fonts/" in rel.lower():
+            continue
+        data = open(path, "rb").read()
+        parts = rel.split("/")
+        tag = "loose-" + (parts[1].lower() if parts[0] == "DLC" else "base")
+        out.append((tag, os.path.basename(path), 0, len(data), data))
+    return out
+
+
+def is_ui(tag):
+    return tag in ("", "e1", "e2", "upgrade1") or tag.startswith("loose-")
+
+
+# names handled elsewhere (fontgen) or not UI art
+NOT_ART = ("twcen", "arial", "atlas_environment", "missingtexture")
+
+
+ATLAS_FILES = set()  # icon atlas file names from the game's IconTextureAtlases XML
+
+
+def load_atlas_files(game):
+    import glob
+    import re
+    for f in glob.glob(os.path.join(game, "Assets", "**", "*IconTextureAtlases*.xml"),
+                       recursive=True):
+        t = open(f, encoding="latin-1").read()
+        ATLAS_FILES.update(m.lower() for m in re.findall(r"<Filename>([^<]+)</Filename>", t))
+        ATLAS_FILES.update(m.lower() for m in re.findall(r'Filename="([^"]+)"', t))
+
+
+def in_category(cat, name, tag):
+    if cat == "compressed":  # any BC texture in the UI archives (format checked later)
+        return is_ui(tag) and not name.startswith(NOT_ART)
+    named = [c for c in CATEGORIES if c not in ("rest", "atlases", "compressed")]
+    if cat in ("rest", "atlases"):
+        if not is_ui(tag) or name.startswith(NOT_ART):
+            return False
+        if any(name.startswith(CATEGORIES[c]) for c in named):
+            return False
+        return (name in ATLAS_FILES) == (cat == "atlases")
+    return name.startswith(CATEGORIES[cat])
+
+
+def render(method, orig, k, ai4=None, fits=None):
+    """orig: 1x RGBA uint8 -> (k x RGBA uint8, box fits)."""
+    h, w = orig.shape[:2]
+    pm = uirecon.premul(orig)
+    if method == "lanczos":
+        return resize_rgba(orig, w * k, h * k, Image.LANCZOS), None
+    if method == "axis":
+        return uirecon.unpremul(uirecon.axis_upscale(pm, k)), None
+    if method == "box":
+        hi, fits = uirecon.box_upscale(pm, k, radii=fits and [f for _, f in fits])
+        return uirecon.unpremul(hi), fits
+    if method == "ring":
+        return uirecon.unpremul(uirecon.ring_upscale(pm, k)[0]), None
+    if method == "ai":
+        hi = uirecon.premul(resize_rgba(ai4, w * k, h * k, Image.LANCZOS))
+        return uirecon.unpremul(uirecon.project(hi, pm, k, smooth=True)), None
+    raise ValueError(method)
+
+
+def merge(out, parts):
+    """Fold separately built category dirs (parallel builds) into out: textures are
+    copied, manifests merged (later entries win per file name)."""
+    import shutil
+    for k in SCALES:
+        d = os.path.join(out, "x%d" % k)
+        os.makedirs(d, exist_ok=True)
+        mf = os.path.join(d, "uiart.txt")
+        entries = {}
+        for src in [d] + [os.path.join(p, "x%d" % k) for p in parts]:
+            m = os.path.join(src, "uiart.txt")
+            if not os.path.exists(m):
+                continue
+            for line in open(m).read().splitlines():
+                if line.strip():
+                    fn = line.split()[4]
+                    if src != d:
+                        shutil.copy2(os.path.join(src, fn), os.path.join(d, fn))
+                    entries[fn] = line
+        open(mf, "w").write("\n".join(entries.values()) + "\n")
+        print("x%d: %d textures" % (k, len(entries)))
+
+
 def main():
+    import re
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        return merge(sys.argv[2], sys.argv[3:])
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["build"])
     ap.add_argument("game")
     ap.add_argument("out")
     ap.add_argument("--category", default="frames", choices=sorted(CATEGORIES))
-    ap.add_argument("--upscaler", default="esrgan", choices=["esrgan", "lanczos"])
     ap.add_argument("--esrgan", default=os.path.join(os.path.dirname(__file__), "..", "build",
                                                      "upscaler", "pkg", "realesrgan-ncnn-vulkan"))
-    ap.add_argument("--model", default="realesrgan-x4plus-anime")
+    ap.add_argument("--model", default="remacri-4x")
+    ap.add_argument("--only", help="regex: restrict to matching texture names")
+    ap.add_argument("--force-method", choices=["box", "axis", "ai", "lanczos", "ring"])
+    ap.add_argument("--list", action="store_true", help="only list textures and methods")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip textures whose outputs already exist in OUT_DIR")
+    ap.add_argument("--max-size", type=int, default=1024,
+                    help="skip textures whose (assembled) image is larger than this")
     a = ap.parse_args()
 
-    keys = CATEGORIES[a.category]
-    items = []  # (name, w, h, mips, mip0 bgra bytes)
-    for name, off, size, data in fpk.entries(os.path.join(a.game, "Resource", "DX9", "UITextures.fpk")):
+    rx = re.compile(a.only) if a.only else None
+    # Base game, G&K, BNW, patches and DLC each ship their own versions of many UI
+    # textures; which one the game uploads depends on what the player has installed, so
+    # build every distinct version (the DLL matches by content hash).
+    entries = load_sources(a.game)
+    load_atlas_files(a.game)
+    # "-index" tile sprites: the data texture is replaced, the index map stays (uisprite.py)
+    index_maps = {(tag, n.lower()[:-len("-index.dds")]): data[off:off + size]
+                  for tag, n, off, size, data in entries if n.lower().endswith("-index.dds")}
+    items, seen = [], set()
+    for tag, name, off, size, data in entries:
         n = name.lower()
-        if not n.endswith(".dds") or n.endswith("-index.dds") or not n.startswith(keys):
+        if not n.endswith(".dds") or n.endswith("-index.dds") or not in_category(a.category, n, tag):
             continue
-        p = parse_dds(data[off:off + size])
-        if p:
-            items.append((n,) + p)
-    print("%s: %d textures" % (a.category, len(items)))
+        if rx and not rx.search(n):
+            continue
+        raw = data[off:off + size]
+        p = parse_dds(raw)
+        bc = None
+        if p is None:
+            q = bcn.parse_dds_bc(raw) if a.category == "compressed" else None
+            if q is None:
+                continue
+            w, h, _, bc, px = q
+            rgba = bcn.decode(w, h, bc, px)
+        else:
+            if a.category == "compressed":
+                continue
+            w, h, _, px = p
+            rgba = np.frombuffer(px, np.uint8).reshape(h, w, 4)[..., [2, 1, 0, 3]].copy()
+        if px in seen:
+            continue
+        # manifest fields are space-separated (and read with %s by the DLL)
+        out_name = ((n[:-4] + "." + tag + ".dds") if tag else n).replace(" ", "_")
+        it = {"name": out_name, "w": w, "h": h, "px": px,
+              "data": rgba, "index": None, "bc": bc}
+        ib = index_maps.get((tag, n[:-4]))
+        if ib is not None:
+            idx = uisprite.parse_index(ib)
+            t = uisprite.tile_size(w, h, idx) if idx is not None else None
+            if not t:
+                print("skipping %s: unknown sprite layout" % it["name"])
+                continue
+            it.update(index=idx, t=t, src=uisprite.assemble(it["data"], idx, t))
+        else:
+            it["src"] = it["data"]
+        if max(it["src"].shape[:2]) > a.max_size:
+            continue
+        if a.resume and all(os.path.exists(os.path.join(a.out, "x%d" % k, it["name"][:-4] +
+                                                        "_x%d.dds" % k)) for k in SCALES):
+            continue
+        seen.add(px)
+        items.append(it)
+    default = CATEGORY_DEFAULT.get(a.category, "box")
+    methods = [a.force_method or method_for(it["name"], default) for it in items]
+    print("%s: %d textures, %d of them tile sprites (%s)" % (
+        a.category, len(items), sum(it["index"] is not None for it in items),
+        ", ".join("%s %d" % (m, methods.count(m)) for m in ("box", "axis", "ai", "lanczos"))))
 
-    origs = [np.frombuffer(px, np.uint8).reshape(h, w, 4)[..., [2, 1, 0, 3]].copy()
-             for _, w, h, _, px in items]
-    up = Esrgan(os.path.abspath(a.esrgan), a.model) if a.upscaler == "esrgan" else None
-    big = upscale_textures(origs, up)
-    base = upscale_textures(origs, None) if up else big  # Lanczos reference for the report
-
+    if a.list:
+        for it, m in zip(items, methods):
+            print("%-44s %4dx%-4d %-7s %s" % (it["name"], it["src"].shape[1], it["src"].shape[0], m,
+                                             "sprite t=%d" % it["t"] if it["index"] is not None else ""))
+        return
     os.makedirs(os.path.join(a.out, "report"), exist_ok=True)
-    report = []
-    for k in SCALES:
-        d = os.path.join(a.out, "x%d" % k)
-        os.makedirs(d, exist_ok=True)
-        manifest = []
-        rows = []
-        for (n, w, h, mips, px), orig, b4, l4 in zip(items, origs, big, base):
-            hi = resize_rgba(b4, w * k, h * k, Image.LANCZOS)
-            fn = n[:-4] + "_x%d.dds" % k
-            write_dds_bgra(os.path.join(d, fn), mip_chain(hi))
-            manifest.append("%016x %d %d %d %s" % (fnv1a64(px), w, h, k, fn))
-            if k == 2:
-                psnr, amae, bad = metrics(orig, hi)
-                ref, _, _ = metrics(orig, resize_rgba(l4, w * k, h * k, Image.LANCZOS))
-                report.append((n, w, h, psnr, ref, amae, bad))
-                rows.append((n, orig, hi))
-        with open(os.path.join(d, "uiart.txt"), "a") as f:
-            f.write("\n".join(manifest) + "\n")
-        if rows:
-            contact_sheet(rows, os.path.join(a.out, "report", a.category), k)
+    report, fits, rows = [], {}, []
+    up = Esrgan(os.path.abspath(a.esrgan), a.model) if "ai" in methods else None
+    # Chunks: upscale, write the textures and update the manifests, so an interrupted
+    # build continues with --resume where it stopped.
+    CHUNK = 24
+    for c0 in range(0, len(items), CHUNK):
+        citems, cmeth = items[c0:c0 + CHUNK], methods[c0:c0 + CHUNK]
+        origs = [it["src"] for it in citems]
+        ai_idx = [i for i, m in enumerate(cmeth) if m == "ai"]
+        ai4 = dict(zip(ai_idx, upscale_textures([origs[i] for i in ai_idx], up))) if ai_idx else {}
+        for k in SCALES:
+            d = os.path.join(a.out, "x%d" % k)
+            os.makedirs(d, exist_ok=True)
+            manifest = []
+            for i, (it, orig, m) in enumerate(zip(citems, origs, cmeth)):
+                n, w, h, px = it["name"], it["w"], it["h"], it["px"]
+                hi, f = render(m, orig, k, ai4.get(i), fits.get(n))
+                if f:
+                    fits[n] = f
+                out = hi
+                if it["index"] is not None:
+                    fallback = np.repeat(np.repeat(it["data"], k, 0), k, 1)
+                    out = uisprite.disassemble(hi, it["index"], it["t"], k, it["data"].shape,
+                                               fallback)
+                fn = n[:-4] + "_x%d.dds" % k
+                if it["bc"]:
+                    bcn.encode_dds(os.path.join(d, fn), out, it["bc"])
+                elif it["index"] is not None:
+                    # tile atlases are uploaded with a single level; mips would be wasted
+                    write_dds_bgra(os.path.join(d, fn), [out])
+                else:
+                    write_dds_bgra(os.path.join(d, fn), mip_chain(out))
+                manifest.append("%016x %d %d %d %s" % (fnv1a64(px), w, h, k, fn))
+                if k == 2:
+                    psnr, amae, bad = metrics(orig, hi)
+                    stair = staircase(orig, hi, k)
+                    ref, _, _ = metrics(orig, resize_rgba(orig, orig.shape[1] * k,
+                                                          orig.shape[0] * k, Image.LANCZOS))
+                    radii = "" if n not in fits else " ".join(
+                        "/".join("%g" % float(v) for v in fc.values()) for _, fc in fits[n])
+                    report.append((n, w, h, m, psnr, ref, amae, bad, "%s%s" % (
+                        "STAIRS? %.0f%% " % (100 * stair) if stair > 0.15 else "", radii)))
+                    # keep only what the contact sheet shows (it crops to 160 x 1x px)
+                    rows.append(("%s [%s]" % (n, m), orig[:, :160].copy(),
+                                 hi[:, :160 * k].copy()))
+            # merge with manifests of other categories / earlier chunks
+            mf = os.path.join(d, "uiart.txt")
+            keep = []
+            if os.path.exists(mf):
+                mine = {l.split()[4] for l in manifest}
+                keep = [l for l in open(mf).read().splitlines()
+                        if l.strip() and l.split()[4] not in mine]
+            open(mf, "w").write("\n".join(keep + manifest) + "\n")
+        print("chunk %d-%d of %d done" % (c0, c0 + len(citems), len(items)), flush=True)
+    if rows:
+        contact_sheet(rows, os.path.join(a.out, "report", a.category), 2)
 
-    # Thin / tiny textures cannot round-trip exactly with any smooth upscaler, so the
-    # AI result is judged against a plain Lanczos baseline: flag it when it is clearly
-    # worse than Lanczos or outright broken.
-    lines = ["%-34s %8s %9s %9s %9s %7s" % ("texture", "size", "PSNR", "Lanczos", "alphaMAE",
-                                            ">48px")]
-    flagged = 0
-    for n, w, h, psnr, ref, amae, bad in sorted(report, key=lambda r: r[3] - r[4]):
-        bad_flag = psnr < 20 or psnr < ref - 6
-        flagged += bad_flag
-        lines.append("%-34s %8s %9.1f %9.1f %9.2f %7d%s" % (n, "%dx%d" % (w, h), psnr, ref, amae,
-                                                           bad, "  <-- check" if bad_flag else ""))
-    lines.append("%d of %d textures flagged" % (flagged, len(report)))
+    lines = ["%-34s %8s %-8s %7s %8s %9s %6s  %s" % ("texture", "size", "method", "PSNR",
+                                                    "Lanczos", "alphaMAE", ">48px", "corner radii")]
+    for n, w, h, m, psnr, ref, amae, bad, radii in sorted(report, key=lambda r: (r[3], r[0])):
+        lines.append("%-34s %8s %-8s %7.1f %8.1f %9.2f %6d  %s" % (n, "%dx%d" % (w, h), m, psnr,
+                                                                 ref, amae, bad, radii))
     txt = "\n".join(lines)
     open(os.path.join(a.out, "report", a.category + ".txt"), "w").write(txt + "\n")
     print(txt)

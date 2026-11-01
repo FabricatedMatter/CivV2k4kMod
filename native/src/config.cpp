@@ -28,6 +28,11 @@ void LoadConfig() {
   g_cfg.crispFonts = ReadFloat(L"CrispFonts", 1.0f) != 0.0f;
   g_cfg.logMouse = ReadFloat(L"LogMouse", 0.0f) != 0.0f;
   g_cfg.aiArt = ReadFloat(L"AIArt", 1.0f) != 0.0f;
+  float dump = ReadFloat(L"DumpTextures", 0.0f);
+  g_cfg.dumpTextures = dump != 0.0f;
+  g_cfg.dumpPixels = dump == 1.0f;
+  g_cfg.overlayScale = (int)ReadFloat(L"OverlayScale", 0.0f);
+  if (g_cfg.overlayScale < 2 || g_cfg.overlayScale > 4) g_cfg.overlayScale = 0;
   g_cfg.strategicViewFix = ReadFloat(L"StrategicViewFix", 1.0f) != 0.0f;
 }
 

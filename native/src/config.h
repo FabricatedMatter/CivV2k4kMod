@@ -13,6 +13,10 @@ struct Config {
   // Align world anchors in strategic view (costs some FPS in that view only).
   bool strategicViewFix = true;
   bool logMouse = false;
+  bool dumpTextures = false;  // UI art diagnostics (1: also dump uploads to UIScale/dump)
+  bool dumpPixels = false;
+  // Experimental: render the map overlay pages (borders, fog) at N x resolution.
+  int overlayScale = 0;
 };
 
 extern Config g_cfg;

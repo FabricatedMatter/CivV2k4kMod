@@ -17,6 +17,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
@@ -122,6 +123,9 @@ void DxbcChecksum(std::vector<uint8_t>& blob) {
   memcpy(blob.data() + 4, st, 16);
 }
 
+void RebuildDxbc(const uint8_t* b, size_t len, uint32_t so, uint32_t ssize, uint32_t nch,
+                 std::vector<uint32_t>& o, std::vector<uint8_t>& out);
+
 bool PatchClipShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, int* changed) {
   auto b = static_cast<const uint8_t*>(bc);
   if (len < 32 || memcmp(b, "DXBC", 4) != 0) return false;
@@ -201,8 +205,15 @@ bool PatchClipShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, int*
     o.insert(o.end(), p, p + l);
   }
   if (!*changed) return false;
-  o[1] = (uint32_t)o.size();
+  RebuildDxbc(b, len, so, ssize, nch, o, out);
+  return true;
+}
 
+// Replaces the SHEX/SHDR token stream of a DXBC container and fixes sizes, chunk
+// offsets and the checksum.
+void RebuildDxbc(const uint8_t* b, size_t len, uint32_t so, uint32_t ssize, uint32_t nch,
+                 std::vector<uint32_t>& o, std::vector<uint8_t>& out) {
+  o[1] = (uint32_t)o.size();
   uint32_t newSize = (uint32_t)o.size() * 4;
   int32_t delta = (int32_t)newSize - (int32_t)ssize;
   out.assign(b, b + so + 4);
@@ -222,6 +233,190 @@ bool PatchClipShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, int*
     }
   }
   DxbcChecksum(out);
+}
+
+// Locates the shader token stream. Returns false if bc is not a DXBC pixel shader.
+bool FindShex(const uint8_t* b, size_t len, uint32_t* so, uint32_t* ssize, uint32_t* nch) {
+  if (len < 32 || memcmp(b, "DXBC", 4) != 0) return false;
+  uint32_t total;
+  memcpy(&total, b + 24, 4);
+  memcpy(nch, b + 28, 4);
+  if (total != len || 32 + 4 * *nch > len) return false;
+  *so = 0;
+  for (uint32_t c = 0; c < *nch; ++c) {
+    uint32_t o;
+    memcpy(&o, b + 32 + 4 * c, 4);
+    if (o + 8 <= len && (!memcmp(b + o, "SHEX", 4) || !memcmp(b + o, "SHDR", 4))) {
+      *so = o;
+      memcpy(ssize, b + o + 4, 4);
+    }
+  }
+  if (!*so || *so + 8 + *ssize > len || *ssize < 8) return false;
+  uint32_t ver;
+  memcpy(&ver, b + *so + 8, 4);
+  return (ver >> 16) == 0;  // pixel shader
+}
+
+// ------------------------------------------------- hi-res tile sprites
+// Civ V draws "-index" tile sprites with a shader that fetches exact 1x texel centres:
+//     mul  R.xy, R.xyxx, cbT.x        ; (tile + frac) * tileSize
+//     round_ni R.xy, R.xyxx
+//     add  R.xy, R.xyxx, l(0.5, 0.5)
+//     div  R.xy, R.xyxx, cbD.xyxx     ; / data texture size (from the file)
+//     sample_l ..., R.xyxx, tN, ...
+// so a k x data texture would only ever be sampled at its 1x positions. Each such
+// sequence is rewritten to use the texture's real size:
+//     resinfo rX.xyzw, l(0), tN.xyzw  ; rX.xy = real size
+//     div  rX.z, rX.x, cbD.x          ; k = real / file width
+//     mul  rX.z, rX.z, cbT.x          ; tileSize * k
+//     mul  R.xy, R.xyxx, rX.z  ...  div R.xy, R.xyxx, rX.xyxx
+// With an unreplaced texture k = 1 and the result is unchanged.
+constexpr uint32_t kOpDiv = 14, kOpMul = 56, kOpSampleL = 72, kOpResinfo = 61,
+                   kOpDclTemps = 104;
+
+// Operand reads one component: select1 (.x) or a replicated swizzle (.xxxx).
+bool IsScalarSel(uint32_t tok) {
+  uint32_t mode = (tok >> 2) & 3, sw = (tok >> 4) & 0xFF;
+  return mode == 2 || (mode == 1 && (sw == 0x00 || sw == 0x55 || sw == 0xAA || sw == 0xFF));
+}
+
+bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, int* changed) {
+  auto b = static_cast<const uint8_t*>(bc);
+  uint32_t so = 0, ssize = 0, nch = 0;
+  if (!FindShex(b, len, &so, &ssize, &nch)) return false;
+  const uint32_t* toks = reinterpret_cast<const uint32_t*>(b + so + 8);
+  const uint32_t* end = toks + ssize / 4;
+  struct Ins {
+    const uint32_t* p;
+    uint32_t op, len, nops;
+    const uint32_t* ops[4];
+    uint32_t olen[4], otype[4], oidx[4];
+  };
+  std::vector<Ins> ins;
+  for (const uint32_t* p = toks + 2; p < end;) {
+    uint32_t l = InstrLen(p);
+    if (!l || p + l > end) return false;
+    Ins in = {p, p[0] & 0x7FF, l, 0, {}, {}, {}, {}};
+    const uint32_t* q = p + 1;
+    // skip extended opcode tokens
+    if (p[0] & 0x80000000u) {
+      while (q < p + l && (*q & 0x80000000u)) ++q;
+      ++q;
+    }
+    if (in.op < 88 || in.op > 106) {  // not a declaration: parse operands
+      while (q < p + l && in.nops < 4) {
+        uint32_t ol, ty, idx;
+        if (!ParseOperand(q, p + l, &ol, &ty, &idx)) break;
+        in.ops[in.nops] = q;
+        in.olen[in.nops] = ol;
+        in.otype[in.nops] = ty;
+        in.oidx[in.nops] = idx;
+        ++in.nops;
+        q += ol;
+      }
+    }
+    ins.push_back(in);
+    p += l;
+  }
+  // temp register count
+  int tempsAt = -1;
+  for (size_t k = 0; k < ins.size(); ++k)
+    if (ins[k].op == kOpDclTemps && ins[k].len == 2) tempsAt = (int)k;
+  if (tempsAt < 0) return false;
+  uint32_t rX = ins[tempsAt].p[1];
+
+  // find (mul ... div, sample_l) sequences
+  struct Hit {
+    size_t mul, div;
+    uint32_t res;
+  };
+  std::vector<Hit> hits;
+  for (size_t k = 1; k < ins.size(); ++k) {
+    const Ins& s = ins[k];
+    if (s.op != kOpSampleL || s.nops < 3 || s.otype[2] != 7) continue;
+    const Ins& d = ins[k - 1];
+    if (d.op != kOpDiv || d.nops != 3 || d.otype[0] != 0 || d.otype[1] != 0 || d.otype[2] != 8)
+      continue;
+    // the cb operand must be a plain cbN[M] (2D immediate index)
+    if (((d.ops[2][0] >> 20) & 3) != 2 || (d.ops[2][0] & 0x80000000u) || d.olen[2] != 3) continue;
+    for (size_t j = k - 1; j-- > 0 && j + 6 >= k;) {
+      const Ins& m = ins[j];
+      // (tile + frac) is a temp, the tile size a scalar cb component (.x); this rules
+      // out the index-map lookup (mul R.xy, v0.xyxx, cbI.xyxx)
+      if (m.op == kOpMul && m.nops == 3 && m.otype[0] == 0 && m.oidx[0] == d.oidx[0] &&
+          m.otype[1] == 0 && m.otype[2] == 8 && m.olen[2] == 3 &&
+          !(m.ops[2][0] & 0x80000000u) && IsScalarSel(m.ops[2][0])) {
+        hits.push_back({j, k - 1, s.oidx[2]});
+        break;
+      }
+    }
+  }
+  if (hits.empty()) {
+    // Looks like a tile-sprite shader (index lookup + rounding) but the pattern did not
+    // match: save it so the variant can be added.
+    int rounds = 0, samplesL = 0;
+    for (const Ins& in : ins) {
+      rounds += in.op == 65;  // round_ni
+      samplesL += in.op == kOpSampleL;
+    }
+    if (rounds >= 2 && samplesL >= 2) {
+      static int n = 0;
+      std::wstring dir = g_modDir + L"\\shaders\\";
+      CreateDirectoryW(dir.c_str(), nullptr);
+      wchar_t nm[64];
+      swprintf(nm, 64, L"unmatched_%02d.dxbc", n++);
+      if (FILE* f = _wfopen((dir + nm).c_str(), L"wb")) {
+        fwrite(bc, 1, len, f);
+        fclose(f);
+      }
+      Log("tile-sprite-like shader not patched (saved %ls)", nm);
+    }
+    return false;
+  }
+
+  std::vector<uint32_t> o(toks, toks + 2);
+  size_t h = 0;
+  for (size_t k = 0; k < ins.size(); ++k) {
+    const Ins& in = ins[k];
+    if ((int)k == tempsAt) {
+      o.push_back(in.p[0]);
+      o.push_back(rX + 1);
+      continue;
+    }
+    if (h < hits.size() && k == hits[h].mul) {
+      const Ins& d = ins[hits[h].div];
+      uint32_t cbSlot = d.ops[2][1], cbElem = d.ops[2][2];
+      // resinfo rX.xyzw, l(0), tN.xyzw
+      o.insert(o.end(), {kOpResinfo | (7u << 24), 0x001000F2u, rX, 0x00004001u, 0u, 0x00107E46u,
+                         hits[h].res});
+      // div rX.z, rX.x, cbD.x
+      o.insert(o.end(), {kOpDiv | (8u << 24), 0x00100042u, rX, 0x0010000Au, rX, 0x0020800Au,
+                         cbSlot, cbElem});
+      // mul rX.z, rX.z, cbT.x  (cbT operand copied as is)
+      o.insert(o.end(), {kOpMul | (8u << 24), 0x00100042u, rX, 0x0010002Au, rX});
+      o.insert(o.end(), in.ops[2], in.ops[2] + 3);
+      // mul R.xy, R.xyxx, rX.z
+      uint32_t bodyLen = in.olen[0] + in.olen[1] + 2;
+      o.push_back((in.p[0] & ~0x7F000000u) | ((1 + bodyLen) << 24));
+      o.insert(o.end(), in.ops[0], in.ops[0] + in.olen[0]);
+      o.insert(o.end(), in.ops[1], in.ops[1] + in.olen[1]);
+      o.insert(o.end(), {0x0010002Au, rX});
+      continue;
+    }
+    if (h < hits.size() && k == hits[h].div) {
+      // div R.xy, R.xyxx, rX.xyxx
+      uint32_t bodyLen = in.olen[0] + in.olen[1] + 2;
+      o.push_back((in.p[0] & ~0x7F000000u) | ((1 + bodyLen) << 24));
+      o.insert(o.end(), in.ops[0], in.ops[0] + in.olen[0]);
+      o.insert(o.end(), in.ops[1], in.ops[1] + in.olen[1]);
+      o.insert(o.end(), {0x00100046u, rX});
+      ++h;
+      continue;
+    }
+    o.insert(o.end(), in.p, in.p + in.len);
+  }
+  *changed = (int)hits.size();
+  RebuildDxbc(b, len, so, ssize, nch, o, out);
   return true;
 }
 
@@ -270,30 +465,149 @@ void LoadArtManifest(const wchar_t* k) {
   Log("AI-upscaled UI art: %u textures (%ls)", (unsigned)g_art.size(), k);
 }
 
+// 32-bit formats the engine uses for UI art. The DX11 renderer uploads the (BGRA) DDS
+// files as R8G8B8A8_TYPELESS, i.e. with red and blue swapped.
+bool IsBGRA(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+         f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+bool IsRGBA(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM ||
+         f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+}
+
+// Block-compressed UI art (BC1 = DXT1, BC3 = DXT5): bytes per 4x4 block, 0 otherwise.
+UINT BCBlockBytes(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+      return 8;
+    case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+      return 16;
+    default:
+      return 0;
+  }
+}
+
+// FNV-1a over mip 0 in the DDS file's byte order (BGRA), whatever the upload order.
+// Diagnostics: which render target is each replaced texture drawn into?
+std::unordered_map<void*, std::wstring> g_artTex;  // replaced texture -> file name
+std::unordered_set<std::wstring> g_artBoundLogged;
+
 uint64_t HashMip0(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* init) {
   uint64_t h = 0xCBF29CE484222325ull;
   auto p = static_cast<const uint8_t*>(init->pSysMem);
-  size_t row = (size_t)d->Width * 4;
+  if (UINT bs = BCBlockBytes(d->Format)) {  // raw blocks, row by block row
+    UINT bw = (d->Width + 3) / 4, bh = (d->Height + 3) / 4;
+    for (UINT y = 0; y < bh; ++y) {
+      const uint8_t* r = p + (size_t)y * init->SysMemPitch;
+      for (size_t x = 0; x < (size_t)bw * bs; ++x) h = (h ^ r[x]) * 0x100000001B3ull;
+    }
+    return h;
+  }
+  bool swap = IsRGBA(d->Format);
   for (UINT y = 0; y < d->Height; ++y) {
     const uint8_t* r = p + (size_t)y * init->SysMemPitch;
-    for (size_t x = 0; x < row; ++x) h = (h ^ r[x]) * 0x100000001B3ull;
+    for (UINT x = 0; x < d->Width; ++x, r += 4) {
+      uint8_t px[4] = {r[swap ? 2 : 0], r[1], r[swap ? 0 : 2], r[3]};
+      for (uint8_t b : px) h = (h ^ b) * 0x100000001B3ull;
+    }
   }
   return h;
+}
+
+// DumpTextures=1: write mip 0 of every distinct uncompressed upload to UIScale/dump as
+// <fmt>_<w>x<h>_<fnv64>.bin (tightly packed rows), to work out how the engine builds
+// the textures it uploads (e.g. the "-index" tile sprites).
+int BytesPerPixel(DXGI_FORMAT f) {
+  if (IsBGRA(f) || IsRGBA(f)) return 4;
+  switch (f) {
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_A8_UNORM:
+      return 1;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+      return 2;
+    default:
+      return 0;
+  }
+}
+std::unordered_set<uint64_t> g_dumped;
+
+void DumpTexture(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* init) {
+  int bpp = BytesPerPixel(d->Format);
+  if (!bpp || g_dumped.size() >= 6000) return;
+  size_t row = (size_t)d->Width * bpp;
+  std::vector<uint8_t> px(row * d->Height);
+  for (UINT y = 0; y < d->Height; ++y)
+    memcpy(&px[y * row], static_cast<const uint8_t*>(init->pSysMem) + (size_t)y * init->SysMemPitch,
+           row);
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (uint8_t b : px) h = (h ^ b) * 0x100000001B3ull;
+  if (!g_dumped.insert(h).second) return;
+  static std::wstring dir;
+  if (dir.empty()) {
+    dir = g_modDir + L"\\dump\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+  }
+  wchar_t name[96];
+  swprintf(name, 96, L"%d_%ux%u_m%u_%016llx.bin", (int)d->Format, d->Width, d->Height,
+           d->MipLevels, (unsigned long long)h);
+  if (FILE* f = _wfopen((dir + name).c_str(), L"wb")) {
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
+  }
+}
+
+// ------------------------------------------------- map overlay pages (experimental)
+// The engine paints borders / fog into square RGBA render targets with auto-generated
+// mips (205 x 256^2, 1024^2, 2048^2) that are then projected onto the terrain. At their
+// fixed resolution the border lines are visibly stair-stepped when zoomed in. With
+// OverlayScale=N they are created N x larger and every viewport / scissor rect used
+// while one is bound is scaled by N; sampling uses normalized UVs, so nothing else moves.
+std::unordered_set<void*> g_overlayRT;
+SRWLOCK g_overlayLock = SRWLOCK_INIT;
+bool IsOverlayRT(const D3D11_TEXTURE2D_DESC* d) {
+  return d->Width == d->Height && (d->Width == 256 || d->Width == 1024 || d->Width == 2048) &&
+         d->ArraySize == 1 && d->Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+         d->BindFlags == (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) &&
+         (d->MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS);
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC* d,
                                           const D3D11_SUBRESOURCE_DATA* init,
                                           ID3D11Texture2D** out) {
+  if (g_cfg.dumpPixels && d && init && init->pSysMem && d->ArraySize == 1) DumpTexture(d, init);
+  if (g_cfg.overlayScale && d && !init && IsOverlayRT(d)) {
+    D3D11_TEXTURE2D_DESC sd = *d;
+    UINT f = (UINT)g_cfg.overlayScale;
+    sd.Width *= f;
+    sd.Height *= f;
+    if (sd.MipLevels) sd.MipLevels += f == 2 ? 1 : 2;
+    HRESULT hr = g_origCreateTex2D(dev, &sd, nullptr, out);
+    if (SUCCEEDED(hr) && out && *out) {
+      AcquireSRWLockExclusive(&g_overlayLock);
+      g_overlayRT.insert(*out);
+      size_t n = g_overlayRT.size();
+      ReleaseSRWLockExclusive(&g_overlayLock);
+      if (n <= 3 || n % 50 == 0)
+        Log("overlay RT #%u %ux%u -> %ux%u", (unsigned)n, d->Width, d->Height, sd.Width,
+            sd.Height);
+      return hr;
+    }
+    Log("overlay RT scaling failed (0x%08lx), using original size", (unsigned long)hr);
+  }
   if (d && init && init->pSysMem && out && d->ArraySize == 1 &&
-      (d->Format == DXGI_FORMAT_B8G8R8A8_UNORM || d->Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-       d->Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+      (IsBGRA(d->Format) || IsRGBA(d->Format) || BCBlockBytes(d->Format)) &&
       g_artSizes.count(((uint64_t)d->Width << 32) | d->Height)) {
     uint64_t h = HashMip0(d, init);
     auto it = g_art.find(h);
     if (it == g_art.end()) {
-      if (g_artMisses++ < 20)
-        Log("UI art candidate %ux%u fmt %d hash %016llx: no match", d->Width, d->Height,
-            (int)d->Format, (unsigned long long)h);
+      if (g_artMisses++ < 40) {
+        auto p = static_cast<const uint8_t*>(init->pSysMem);
+        Log("UI art candidate %ux%u fmt %d hash %016llx: no match (px0 %02x%02x%02x%02x)",
+            d->Width, d->Height, (int)d->Format, (unsigned long long)h, p[0], p[1], p[2], p[3]);
+      }
     } else {
       FILE* f = _wfopen(it->second.file.c_str(), L"rb");
       std::vector<uint8_t> buf;
@@ -317,20 +631,31 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
         hd.MipLevels = levels;
         std::vector<D3D11_SUBRESOURCE_DATA> sub(levels);
         size_t off = 128;
-        bool ok = true;
-        for (UINT i = 0; i < levels; ++i) {
+        UINT bs = BCBlockBytes(d->Format);
+        // the file must be of the same family: BGRA for 32-bit, DXT1 / DXT5 for BC1 / BC3
+        bool ok = bs ? !memcmp(&buf[84], bs == 8 ? "DXT1" : "DXT5", 4)
+                     : !memcmp(&buf[84], "\0\0\0\0", 4);
+        for (UINT i = 0; i < levels && ok; ++i) {
           UINT lw = fw >> i ? fw >> i : 1, lh = fh >> i ? fh >> i : 1;
-          if (off + (size_t)lw * lh * 4 > buf.size()) ok = false;
-          sub[i] = {buf.data() + off, lw * 4, 0};
-          off += (size_t)lw * lh * 4;
+          UINT pitch = bs ? ((lw + 3) / 4) * bs : lw * 4;
+          size_t size = bs ? (size_t)pitch * ((lh + 3) / 4) : (size_t)lw * lh * 4;
+          if (off + size > buf.size()) ok = false;
+          sub[i] = {buf.data() + off, pitch, 0};
+          off += size;
         }
         if (ok) {
-          if (d->Format == DXGI_FORMAT_R8G8B8A8_UNORM)  // files are BGRA
-            hd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+          // files are BGRA; keep the engine's format (its views expect it) and swap instead
+          if (IsRGBA(d->Format) && !bs)
+            for (size_t i = 128; i + 3 < off; i += 4) std::swap(buf[i], buf[i + 2]);
           HRESULT hr = g_origCreateTex2D(dev, &hd, sub.data(), out);
           if (SUCCEEDED(hr)) {
-            if (++g_artReplaced <= 5 || g_artReplaced % 25 == 0)
-              Log("UI art replaced #%d: %ux%u -> %ux%u", g_artReplaced, d->Width, d->Height, fw, fh);
+            const std::wstring& fn = it->second.file;
+            g_artTex[*out] = fn.substr(fn.rfind(L'\\') + 1);
+            if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0) {
+              const std::wstring& f = it->second.file;
+              Log("UI art replaced #%d: %ux%u -> %ux%u %ls", g_artReplaced, d->Width, d->Height,
+                  fw, fh, f.c_str() + (f.rfind(L'\\') + 1));
+            }
             return hr;
           }
           Log("UI art texture creation failed 0x%08lx", (unsigned long)hr);
@@ -380,8 +705,54 @@ ID3D11Buffer* ScaleBuffer(ID3D11Device* dev) {
   return r;
 }
 
+HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device*, const void*, SIZE_T,
+                                            ID3D11ClassLinkage*, ID3D11PixelShader**);
+std::unordered_map<void*, std::vector<uint8_t>> g_psCode;  // diagnostics: PS -> bytecode
+void* g_curPS[2] = {};
+std::unordered_set<void*> g_psDumped;
+void DumpPSCode(void* ps, const wchar_t* tag) {
+  EnterCriticalSection(&g_cs);
+  auto pc = g_psCode.find(ps);
+  if (pc != g_psCode.end() && g_psDumped.insert(ps).second) {
+    std::wstring dir = g_modDir + L"\\shaders\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t nm[64];
+    swprintf(nm, 64, L"%ls_ps_%p.dxbc", tag, ps);
+    if (FILE* f = _wfopen((dir + nm).c_str(), L"wb")) {
+      fwrite(pc->second.data(), 1, pc->second.size(), f);
+      fclose(f);
+    }
+  }
+  LeaveCriticalSection(&g_cs);
+}
+
+void RememberPS(ID3D11PixelShader** out, const void* bc, SIZE_T len) {
+  if (!g_cfg.dumpTextures || !out || !*out || !bc) return;
+  EnterCriticalSection(&g_cs);
+  auto p = static_cast<const uint8_t*>(bc);
+  g_psCode[*out].assign(p, p + len);
+  LeaveCriticalSection(&g_cs);
+}
+
 HRESULT STDMETHODCALLTYPE HookCreatePS(ID3D11Device* dev, const void* bc, SIZE_T len,
                                        ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
+  HRESULT hr0 = HookCreatePSInner(dev, bc, len, link, out);
+  if (SUCCEEDED(hr0)) RememberPS(out, bc, len);
+  return hr0;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device* dev, const void* bc, SIZE_T len,
+                                            ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
+  const void* origBc = bc;
+  SIZE_T origLen = len;
+  // 1) hi-res tile sprites (only when replacement art is loaded)
+  std::vector<uint8_t> sprite;
+  int nSprite = 0;
+  if (!g_art.empty() && bc && PatchSpriteShader(bc, len, sprite, &nSprite)) {
+    bc = sprite.data();
+    len = sprite.size();
+  }
+  // 2) UI clip rects
   std::vector<uint8_t> patched;
   int changed = 0;
   if (IsActive() && bc && PatchClipShader(bc, len, patched, &changed)) {
@@ -393,9 +764,20 @@ HRESULT STDMETHODCALLTYPE HookCreatePS(ID3D11Device* dev, const void* bc, SIZE_T
       LeaveCriticalSection(&g_cs);
       if (n <= 3 || n % 10 == 0)
         Log("patched UI clip pixel shader #%d (%d clip instructions)", n, changed);
+      if (nSprite) Log("patched tile sprite shader (%d fetches)", nSprite);
       return hr;
     }
     Log("patched shader rejected (0x%08lx), using original", (unsigned long)hr);
+    return g_origCreatePS(dev, origBc, origLen, link, out);
+  }
+  if (nSprite) {
+    HRESULT hr = g_origCreatePS(dev, bc, len, link, out);
+    if (SUCCEEDED(hr)) {
+      Log("patched tile sprite shader (%d fetches)", nSprite);
+      return hr;
+    }
+    Log("patched sprite shader rejected (0x%08lx), using original", (unsigned long)hr);
+    return g_origCreatePS(dev, origBc, origLen, link, out);
   }
   return g_origCreatePS(dev, bc, len, link, out);
 }
@@ -404,6 +786,7 @@ template <int W>
 void STDMETHODCALLTYPE HookPSSetShader(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                                        ID3D11ClassInstance* const* ci, UINT n) {
   g_origPSSetShader[W](ctx, ps, ci, n);
+  g_curPS[W] = ps;
   if (!ps) return;
   EnterCriticalSection(&g_cs);
   bool ours = g_patched.count(ps) != 0;
@@ -429,6 +812,223 @@ void PatchVt(void** vt, int idx, void* fn, void** orig) {
   VirtualProtect(&vt[idx], sizeof(void*), old, &old);
 }
 
+constexpr int kVtPSSetSRV = 8;  // ID3D11DeviceContext::PSSetShaderResources
+using PSSetSRVFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
+                                             ID3D11ShaderResourceView* const*);
+PSSetSRVFn g_origPSSetSRV[2] = {};
+
+const std::wstring* g_boundArt[2][8] = {};
+std::unordered_set<std::wstring> g_drawLogged;
+constexpr int kVtDrawIndexed = 12, kVtDraw = 13;
+using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
+using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+DrawIndexedFn g_origDrawIndexed[2] = {};
+DrawFn g_origDraw[2] = {};
+
+void DumpPSCode(void* ps, const wchar_t* tag);
+
+template <int S>
+void NoteDraw() {
+  for (int i = 0; i < 8; ++i) {
+    const std::wstring* a = g_boundArt[S][i];
+    if (!a || g_drawLogged.size() > 300) continue;
+    wchar_t key[300];
+    swprintf(key, 300, L"%ls@%p", a->c_str(), g_curPS[S]);
+    if (!g_drawLogged.insert(key).second) continue;
+    Log("draw ctx%d slot %d %ls ps %p", S, i, a->c_str(), g_curPS[S]);
+    DumpPSCode(g_curPS[S], L"draw");
+  }
+}
+template <int S>
+void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* c, UINT n, UINT i0, INT b) {
+  NoteDraw<S>();
+  g_origDrawIndexed[S](c, n, i0, b);
+}
+template <int S>
+void STDMETHODCALLTYPE HookDraw(ID3D11DeviceContext* c, UINT n, UINT v0) {
+  NoteDraw<S>();
+  g_origDraw[S](c, n, v0);
+}
+
+template <int S>
+void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* c, UINT start, UINT n,
+                                    ID3D11ShaderResourceView* const* v) {
+  for (UINT i = 0; i < n && start + i < 8; ++i) {
+    const std::wstring* a = nullptr;
+    if (v && v[i]) {
+      ID3D11Resource* r = nullptr;
+      v[i]->GetResource(&r);
+      if (r) {
+        auto it = g_artTex.find(r);
+        if (it != g_artTex.end()) a = &it->second;
+        r->Release();
+      }
+    }
+    g_boundArt[S][start + i] = a;
+  }
+  if (v && !g_artTex.empty() && g_artBoundLogged.size() < 150) {
+    for (UINT i = 0; i < n; ++i) {
+      if (!v[i]) continue;
+      ID3D11Resource* r = nullptr;
+      v[i]->GetResource(&r);
+      if (!r) continue;
+      auto it = g_artTex.find(r);
+      r->Release();
+      if (it == g_artTex.end() || !g_artBoundLogged.insert(it->second).second) continue;
+      ID3D11RenderTargetView* rtv = nullptr;
+      c->OMGetRenderTargets(1, &rtv, nullptr);
+      D3D11_TEXTURE2D_DESC td = {};
+      if (rtv) {
+        ID3D11Resource* rr = nullptr;
+        rtv->GetResource(&rr);
+        D3D11_RESOURCE_DIMENSION dim;
+        if (rr) {
+          rr->GetType(&dim);
+          if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+            static_cast<ID3D11Texture2D*>(rr)->GetDesc(&td);
+          rr->Release();
+        }
+        rtv->Release();
+      }
+      D3D11_VIEWPORT vp = {};
+      UINT nvp = 1;
+      c->RSGetViewports(&nvp, &vp);
+      Log("art bound ctx%d slot %u %ls -> RT %ux%u fmt %d bind 0x%x misc 0x%x mips %u, vp %.0fx%.0f "
+          "ps %p",
+          S, start + i, it->second.c_str(), td.Width, td.Height, (int)td.Format, td.BindFlags,
+          td.MiscFlags, td.MipLevels, vp.Width, vp.Height, g_curPS[S]);
+      EnterCriticalSection(&g_cs);
+      auto pc = g_psCode.find(g_curPS[S]);
+      if (pc != g_psCode.end() && g_psDumped.insert(g_curPS[S]).second) {
+        std::wstring dir = g_modDir + L"\\shaders\\";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        wchar_t nm[64];
+        swprintf(nm, 64, L"ps_%p.dxbc", g_curPS[S]);
+        if (FILE* f = _wfopen((dir + nm).c_str(), L"wb")) {
+          fwrite(pc->second.data(), 1, pc->second.size(), f);
+          fclose(f);
+        }
+      }
+      LeaveCriticalSection(&g_cs);
+    }
+  }
+  g_origPSSetSRV[S](c, start, n, v);
+}
+
+constexpr int kVtOMSetRT = 33, kVtRSSetViewports = 44, kVtRSSetScissor = 45;
+using OMSetRTFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+                                            ID3D11RenderTargetView* const*,
+                                            ID3D11DepthStencilView*);
+using RSSetVPFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+using RSSetSciFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_RECT*);
+OMSetRTFn g_origOMSetRT[2] = {};
+RSSetVPFn g_origRSSetVP[2] = {};
+RSSetSciFn g_origRSSetSci[2] = {};
+float g_rtScale[2] = {1.0f, 1.0f};
+D3D11_VIEWPORT g_lastVP[2][4];
+UINT g_lastVPn[2] = {};
+D3D11_RECT g_lastSci[2][4];
+UINT g_lastScin[2] = {};
+int g_vpScaledLogged = 0;
+
+template <int S>
+void ApplyViewports(ID3D11DeviceContext* c) {
+  D3D11_VIEWPORT v[4];
+  UINT n = g_lastVPn[S];
+  for (UINT i = 0; i < n; ++i) {
+    v[i] = g_lastVP[S][i];
+    v[i].TopLeftX *= g_rtScale[S];
+    v[i].TopLeftY *= g_rtScale[S];
+    v[i].Width *= g_rtScale[S];
+    v[i].Height *= g_rtScale[S];
+  }
+  if (n) g_origRSSetVP[S](c, n, v);
+  D3D11_RECT r[4];
+  UINT m = g_lastScin[S];
+  for (UINT i = 0; i < m; ++i) {
+    r[i] = g_lastSci[S][i];
+    r[i].left = (LONG)(r[i].left * g_rtScale[S]);
+    r[i].top = (LONG)(r[i].top * g_rtScale[S]);
+    r[i].right = (LONG)(r[i].right * g_rtScale[S]);
+    r[i].bottom = (LONG)(r[i].bottom * g_rtScale[S]);
+  }
+  if (m) g_origRSSetSci[S](c, m, r);
+}
+
+template <int S>
+void STDMETHODCALLTYPE HookOMSetRT(ID3D11DeviceContext* c, UINT n,
+                                   ID3D11RenderTargetView* const* rtv,
+                                   ID3D11DepthStencilView* dsv) {
+  g_origOMSetRT[S](c, n, rtv, dsv);
+  float sc = 1.0f;
+  if (n && rtv && rtv[0]) {
+    ID3D11Resource* r = nullptr;
+    rtv[0]->GetResource(&r);
+    if (r) {
+      AcquireSRWLockShared(&g_overlayLock);
+      bool known = g_overlayRT.count(r) != 0;
+      ReleaseSRWLockShared(&g_overlayLock);
+      if (known) {
+        // guard against a freed page's address being reused by another texture
+        D3D11_RESOURCE_DIMENSION dim;
+        r->GetType(&dim);
+        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+          D3D11_TEXTURE2D_DESC td;
+          static_cast<ID3D11Texture2D*>(r)->GetDesc(&td);
+          UINT f = (UINT)g_cfg.overlayScale;
+          D3D11_TEXTURE2D_DESC base = td;
+          base.Width /= f;
+          base.Height /= f;
+          if (td.Width % f == 0 && IsOverlayRT(&base)) sc = (float)f;
+        }
+      }
+      r->Release();
+    }
+  }
+  if (sc != g_rtScale[S]) {
+    g_rtScale[S] = sc;
+    ApplyViewports<S>(c);
+    if (sc > 1.0f && g_vpScaledLogged++ < 3) Log("overlay RT bound: viewports scaled x%.0f", sc);
+  }
+}
+
+template <int S>
+void STDMETHODCALLTYPE HookRSSetVP(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* v) {
+  g_lastVPn[S] = n > 4 ? 4 : n;
+  for (UINT i = 0; i < g_lastVPn[S]; ++i) g_lastVP[S][i] = v[i];
+  if (g_rtScale[S] == 1.0f) {
+    g_origRSSetVP[S](c, n, v);
+    return;
+  }
+  D3D11_VIEWPORT t[4];
+  for (UINT i = 0; i < g_lastVPn[S]; ++i) {
+    t[i] = v[i];
+    t[i].TopLeftX *= g_rtScale[S];
+    t[i].TopLeftY *= g_rtScale[S];
+    t[i].Width *= g_rtScale[S];
+    t[i].Height *= g_rtScale[S];
+  }
+  g_origRSSetVP[S](c, g_lastVPn[S], t);
+}
+
+template <int S>
+void STDMETHODCALLTYPE HookRSSetSci(ID3D11DeviceContext* c, UINT n, const D3D11_RECT* r) {
+  g_lastScin[S] = n > 4 ? 4 : n;
+  for (UINT i = 0; i < g_lastScin[S]; ++i) g_lastSci[S][i] = r[i];
+  if (g_rtScale[S] == 1.0f) {
+    g_origRSSetSci[S](c, n, r);
+    return;
+  }
+  D3D11_RECT t[4];
+  for (UINT i = 0; i < g_lastScin[S]; ++i) {
+    t[i].left = (LONG)(r[i].left * g_rtScale[S]);
+    t[i].top = (LONG)(r[i].top * g_rtScale[S]);
+    t[i].right = (LONG)(r[i].right * g_rtScale[S]);
+    t[i].bottom = (LONG)(r[i].bottom * g_rtScale[S]);
+  }
+  g_origRSSetSci[S](c, g_lastScin[S], t);
+}
+
 void HookContextVt(ID3D11DeviceContext* ctx) {
   void** vt = *reinterpret_cast<void***>(ctx);
   if (g_ctxVt[0] == vt || g_ctxVt[1] == vt) return;
@@ -439,6 +1039,23 @@ void HookContextVt(ID3D11DeviceContext* ctx) {
   PatchVt(vt, kVtPSSetShader,
           slot == 0 ? (void*)&HookPSSetShader<0> : (void*)&HookPSSetShader<1>,
           reinterpret_cast<void**>(&g_origPSSetShader[slot]));
+  if (g_cfg.overlayScale) {
+    PatchVt(vt, kVtOMSetRT, slot == 0 ? (void*)&HookOMSetRT<0> : (void*)&HookOMSetRT<1>,
+            reinterpret_cast<void**>(&g_origOMSetRT[slot]));
+    PatchVt(vt, kVtRSSetViewports, slot == 0 ? (void*)&HookRSSetVP<0> : (void*)&HookRSSetVP<1>,
+            reinterpret_cast<void**>(&g_origRSSetVP[slot]));
+    PatchVt(vt, kVtRSSetScissor, slot == 0 ? (void*)&HookRSSetSci<0> : (void*)&HookRSSetSci<1>,
+            reinterpret_cast<void**>(&g_origRSSetSci[slot]));
+  }
+  if (g_cfg.dumpTextures) {
+    PatchVt(vt, kVtPSSetSRV, slot == 0 ? (void*)&HookPSSetSRV<0> : (void*)&HookPSSetSRV<1>,
+            reinterpret_cast<void**>(&g_origPSSetSRV[slot]));
+    PatchVt(vt, kVtDrawIndexed,
+            slot == 0 ? (void*)&HookDrawIndexed<0> : (void*)&HookDrawIndexed<1>,
+            reinterpret_cast<void**>(&g_origDrawIndexed[slot]));
+    PatchVt(vt, kVtDraw, slot == 0 ? (void*)&HookDraw<0> : (void*)&HookDraw<1>,
+            reinterpret_cast<void**>(&g_origDraw[slot]));
+  }
 }
 
 bool g_vtHooked = false;
@@ -469,9 +1086,9 @@ void HookD3DVtables() {
   PatchVt(*reinterpret_cast<void***>(dev), kVtCreatePS, (void*)&HookCreatePS,
           reinterpret_cast<void**>(&g_origCreatePS));
   float s = ConfiguredScale();
-  if (g_cfg.aiArt && s >= 1.25f) {
-    LoadArtManifest(s > 2.5f ? L"x3" : L"x2");
-    if (!g_art.empty())
+  if (g_cfg.aiArt && s >= 1.25f) LoadArtManifest(s > 2.5f ? L"x3" : L"x2");
+  {
+    if (!g_art.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
       PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
               reinterpret_cast<void**>(&g_origCreateTex2D));
   }
