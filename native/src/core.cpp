@@ -12,6 +12,8 @@
 #include "core.h"
 
 #include <windows.h>
+
+#include <string>
 #include <windowsx.h>
 
 #include <cmath>
@@ -22,6 +24,8 @@
 
 namespace uis {
 void HookD3DVtablesOnce();
+void EnsureD3DHooks();
+bool D3DHooksReady();
 
 namespace {
 constexpr int kOffW = 0x644;
@@ -88,10 +92,41 @@ void EnforceSmallAssets() {
 // Called inside ApplyResolution right after the device reset, i.e. after the
 // real size was consumed by the swapchain but before the UI projection, the
 // world-anchor viewport and the re-anchor request are built from it.
+// Safe mode: without the D3D hooks a scaled UI renders with empty lists and text fields
+// (clip shaders unpatched), so the UI then stays at 100 % for the whole session and the
+// player is told why.
+bool g_safeMode = false;
+std::string g_warning;
+
+DWORD WINAPI WarningBox(LPVOID) {
+  std::wstring w(g_warning.begin(), g_warning.end());
+  MessageBoxW(nullptr, w.c_str(), L"Civ V UI Scale",
+              MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+  return 0;
+}
+
+void CheckSafeMode() {
+  static bool checked = false;
+  if (checked) return;
+  checked = true;
+  EnsureD3DHooks();
+  if (D3DHooksReady() || ComputeScale() < 1.01f) return;
+  g_safeMode = true;
+  g_warning =
+      "Civ V UI Scale could not attach to the game's graphics this time, so the interface "
+      "stays at its normal size for this session. Everything else works as usual.\n\n"
+      "Restarting the game usually fixes this. If it keeps happening, please report it and "
+      "include Logs\\UIScale.log from My Games\\Sid Meier's Civilization 5.";
+  Log("SAFE MODE: D3D hooks not installed before the UI layout - UI scaling disabled for "
+      "this session");
+  if (g_cfg.failWarning) CloseHandle(CreateThread(nullptr, 0, WarningBox, nullptr, 0, nullptr));
+}
+
 void ConvertToVirtual(uint8_t* obj) {
   g_realW = *reinterpret_cast<int*>(obj + kOffW);
   g_realH = *reinterpret_cast<int*>(obj + kOffH);
-  g_scale = ComputeScale();
+  CheckSafeMode();
+  g_scale = g_safeMode ? 1.0f : ComputeScale();
   g_virtW = (int)lroundf(g_realW / g_scale);
   g_virtH = (int)lroundf(g_realH / g_scale);
   if (g_virtW < 800 || g_virtH < 600) {  // keep layouts above a sane minimum size
@@ -298,6 +333,7 @@ bool InstallCore() {
 }
 
 bool IsActive() { return g_active; }
+const char* Warning() { return g_warning.empty() ? nullptr : g_warning.c_str(); }
 float EffectiveScale() { return g_scale; }
 float ConfiguredScale() { return ComputeScale(); }
 

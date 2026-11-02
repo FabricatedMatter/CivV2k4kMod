@@ -39,7 +39,8 @@ only be unlocked with the matching original from your own game files. Without th
 noise, and art of DLC you do not own stays locked.
 
 Settings: `My Games/Sid Meier's Civilization 5/UIScale.ini` · Log: `Logs/UIScale.log`
-(`AIArt=0` disables the art; `OverlayScale=2` is an experimental sharper map-border mode).
+(`AIArt=0` disables the art). If the mod cannot attach to the game's graphics it keeps the
+interface at its normal size for that session and shows a warning instead of a broken UI.
 
 ## How it works
 

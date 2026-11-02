@@ -32,6 +32,8 @@ void LoadConfig() {
   g_cfg.dumpTextures = dump != 0.0f;
   g_cfg.dumpPixels = dump == 1.0f;
   g_cfg.overlayDiag = dump == 3.0f;
+  g_cfg.failWarning = ReadFloat(L"FailWarning", 1.0f) != 0.0f;
+  g_cfg.testSafeMode = ReadFloat(L"TestSafeMode", 0.0f) != 0.0f;
   g_cfg.overlayScale = (int)ReadFloat(L"OverlayScale", 0.0f);
   if (g_cfg.overlayScale < 2 || g_cfg.overlayScale > 4) g_cfg.overlayScale = 0;
   g_cfg.strategicViewFix = ReadFloat(L"StrategicViewFix", 1.0f) != 0.0f;

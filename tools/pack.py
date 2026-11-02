@@ -148,7 +148,10 @@ def unpack(game, packs, dest, progress=None):
             with open(out, "wb") as o:
                 o.write(plain[4 + mlen:])
         if meta.get("manifest"):
-            manifests.setdefault(os.path.dirname(out), []).append(meta["manifest"])
+            # file entries: next to the file; index stand-ins ("null"): their manifest dir
+            mdir = os.path.join(dest, *meta["mdir"].split("/")) if meta.get("mdir") else \
+                os.path.dirname(os.path.join(dest, *meta["paths"][0].split("/")))
+            manifests.setdefault(mdir, []).append(meta["manifest"])
         done += 1
         if progress:
             progress(done, done + len(index))
@@ -177,10 +180,12 @@ def build(entries, out):
             if first[2] != data:
                 print("warning: %s differs from %s although their originals are identical;"
                       " keeping the first" % (meta["path"], first[1]["paths"][0]))
-            first[1]["paths"].append(meta["path"])
+            if "path" in meta:
+                first[1]["paths"].append(meta["path"])
             continue
         meta = dict(meta)
-        meta["paths"] = [meta.pop("path")]
+        if "path" in meta:
+            meta["paths"] = [meta.pop("path")]
         by_id[eid] = (src, meta, data)
         unique.append(by_id[eid])
     entries = unique
@@ -209,15 +214,25 @@ def collect(game, scale, art_dir, font_dir):
     k = "x%d" % scale
     entries = []
     # UIArt: output names come from uiart's (tag, name) naming of the sources
-    by_out = {}
+    by_out, by_index = {}, {}
     for tag, name, off, size, data in uiart.load_sources(game):
         n = name.lower()
-        if n.endswith(".dds") and not n.endswith("-index.dds"):
-            out = ((n[:-4] + "." + tag + ".dds") if tag else n).replace(" ", "_")
-            by_out.setdefault(out[:-4], data[off:off + size])
+        if not n.endswith(".dds"):
+            continue
+        idx = n.endswith("-index.dds")
+        base = n[:-len("-index.dds")] if idx else n[:-4]
+        out = ((base + "." + tag) if tag else base).replace(" ", "_")
+        (by_index if idx else by_out).setdefault(out, data[off:off + size])
     adir = os.path.join(art_dir, k)
     for line in open(os.path.join(adir, "uiart.txt")).read().splitlines():
         fn = line.split()[4]
+        if fn.endswith(".idx.null"):  # index map replaced by a stand-in: key = the index map
+            src = by_index.get(fn[:-len("_" + k + ".idx.null")])
+            if src is None:
+                print("no original for", fn)
+                continue
+            entries.append((src, {"paths": [], "mdir": "UIArt/%s" % k, "manifest": line}, b""))
+            continue
         src = by_out.get(fn[:-len("_" + k + ".dds")])
         if src is None:
             print("no original for", fn)

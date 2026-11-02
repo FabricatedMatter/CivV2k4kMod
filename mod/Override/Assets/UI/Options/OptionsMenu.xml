@@ -176,6 +176,7 @@
             <!-- UI Scale (Civ V UI Scale mod) -->
             <Stack ID="UIScaleBlock" Anchor="C,C" Padding="5" Hidden="1" >
               <Label Offset="0,20" Anchor="C,C" ID="UIScaleValue" String="UI Scale: 100%" ToolTip="Size of all interface elements, independent of the screen resolution." />
+              <Label Anchor="C,C" ID="UIScaleWarning" WrapWidth="420" Hidden="1" String="" />
               <Slider Anchor="C,C" Length="300" Style="Slider" ID="UIScaleSlider" WheelSteps="50" ToolTip="Size of all interface elements, independent of the screen resolution." />
               <Stack Anchor="C,C" StackGrowth="Right" Padding="24" >
                 <CheckBox Anchor="L,C" String="Automatic" IsChecked="1" ID="UIScaleAutoCheck" ToolTip="Pick the scale from the screen height (1080p = 100%)." />

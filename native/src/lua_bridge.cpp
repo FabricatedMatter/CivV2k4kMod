@@ -1,5 +1,6 @@
 // Exposes the mod to Lua:
 //   UIScale.IsActive()        -> bool   (false if the exe build is unsupported)
+//   UIScale.GetWarning()      -> string or nil (safe mode: why the UI is not scaled)
 //   UIScale.Get()             -> number (scale currently applied)
 //   UIScale.GetSetting()      -> number (configured value, 0 = auto)
 //   UIScale.GetAuto()         -> number (what "auto" resolves to)
@@ -44,6 +45,13 @@ SetFieldFn g_origSetField = nullptr;
 using SetFenvFn = int(__cdecl*)(lua_State*, int);
 SetFenvFn g_origSetFenv = nullptr;
 constexpr int LUA_REGISTRYINDEX = -10000;
+
+int __cdecl l_GetWarning(lua_State* L) {
+  const char* w = Warning();
+  if (!w) return 0;
+  L_.pushstring(L, w);
+  return 1;
+}
 
 int __cdecl l_IsActive(lua_State* L) {
   L_.pushboolean(L, IsActive());
@@ -96,7 +104,7 @@ void PushTable(lua_State* L) {
   } fns[] = {{"IsActive", l_IsActive},       {"Get", l_Get},
              {"GetSetting", l_GetSetting},   {"GetAuto", l_GetAuto},
              {"GetRealSize", l_GetRealSize}, {"GetVirtualSize", l_GetVirtualSize},
-             {"Set", l_Set}};
+             {"Set", l_Set},                 {"GetWarning", l_GetWarning}};
   for (auto& f : fns) {
     L_.pushcclosure(L, f.fn, 0);
     L_.setfield(L, -2, f.name);

@@ -20,6 +20,13 @@ def parse_index(data):
     return np.frombuffer(data[128:128 + w * h * bits // 8], dt).reshape(h, w).astype(np.int64)
 
 
+def index_bytes(data):
+    """Raw mip 0 bytes of an index map (what the game uploads)."""
+    h, w = struct.unpack_from("<II", data, 12)
+    bits = struct.unpack_from("<I", data, 88)[0]
+    return data[128:128 + w * h * bits // 8]
+
+
 def tile_size(data_w, data_h, index):
     """Tile edge length: the data texture holds exactly max(index)+1 tiles (or more)."""
     n = int(index.max()) + 1
@@ -43,22 +50,50 @@ def assemble(data_rgba, index, t):
     return out
 
 
-def disassemble(hi, index, t, k, data_shape, fallback):
-    """Cut a k x assembled image back into a k x data texture. Each tile is taken from
-    its first occurrence in the index; tiles that never occur come from fallback
-    (the k x data texture rendered some other way)."""
+def disassemble(hi, index, t, k, data_shape, fallback, data=None):
+    """Cut a k x assembled image back into a k x data texture.
+
+    A tile used at several places is the average of all its occurrences (so upscaler
+    bleed from one neighbourhood does not get copied everywhere the tile is reused),
+    and a tile that is a single colour at 1x is exactly that colour at k x. Tiles that
+    never occur come from fallback (the k x data texture rendered some other way)."""
     dh, dw = data_shape[:2]
     per = dw // t
     T = t * k
     out = fallback.copy()
-    done = set()
+    acc, cnt = {}, {}
     ih, iw = index.shape
     for y in range(ih):
         for x in range(iw):
             tid = int(index[y, x])
-            if tid in done:
-                continue
-            done.add(tid)
-            ty, tx = divmod(tid, per)
-            out[ty * T:(ty + 1) * T, tx * T:(tx + 1) * T] = hi[y * T:(y + 1) * T, x * T:(x + 1) * T]
+            blk = hi[y * T:(y + 1) * T, x * T:(x + 1) * T].astype(np.float64)
+            if tid in acc:
+                acc[tid] += blk
+                cnt[tid] += 1
+            else:
+                acc[tid] = blk.copy()
+                cnt[tid] = 1
+    for tid, a in acc.items():
+        ty, tx = divmod(tid, per)
+        out[ty * T:(ty + 1) * T, tx * T:(tx + 1) * T] = np.clip(a / cnt[tid] + 0.5, 0, 255)
+    if data is not None:
+        fix_uniform_tiles(out, data, t, k)
     return out
+
+
+def fix_uniform_tiles(hi_data, data, t, k):
+    """In place: tiles that are one colour at 1x become exactly that colour at k x.
+    Returns the number of tiles changed."""
+    dh, dw = data.shape[:2]
+    T = t * k
+    n = 0
+    for ty in range(dh // t):
+        for tx in range(dw // t):
+            lo = data[ty * t:(ty + 1) * t, tx * t:(tx + 1) * t]
+            c = lo.reshape(-1, lo.shape[-1])
+            if (c.max(axis=0).astype(int) - c.min(axis=0)).max() <= 1:
+                blk = hi_data[ty * T:(ty + 1) * T, tx * T:(tx + 1) * T]
+                if (np.abs(blk.astype(int) - c[0]).max() > 0):
+                    blk[...] = c[0]
+                    n += 1
+    return n

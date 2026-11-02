@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+
+Culture border cross section:
+
+ ___________________________________________
+|       primary_width/primary_alpha         |  <- Primary Color
+|___________________________________________|
+|                                           |
+|     secondary_width/secondary_alpha       |  <- Secondary Color
+|                                           |
+|___________________________________________|
+
+
+-->
+
+<!-- Civ V UI Scale: wider anti-aliasing (primary .5 -> 1.2, secondary .3 -> 1.0,
+     city-state .5 -> 1.2) so border edges stay smooth on high-resolution screens. -->
+<CultureBorders primary_width = "1.4" secondary_width = "20" 
+                primary_aa_width = "1.2" secondary_aa_width = "1.0"
+                primary_alpha = "200" secondary_alpha = "90"
+                corner_bias = "0.105"
+                
+                cs_primary_width = "2.8" cs_outline_width =".4"
+                cs_aa_width = "1.2"
+                cs_primary_alpha = "130" cs_outline_alpha ="160"
+                cs_dash_width ="8"
+                
+                randomness = "6"
+                expansion = "2"
+                />

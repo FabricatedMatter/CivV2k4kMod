@@ -272,7 +272,8 @@ bool FindShex(const uint8_t* b, size_t len, uint32_t* so, uint32_t* ssize, uint3
 //     mul  R.xy, R.xyxx, rX.z  ...  div R.xy, R.xyxx, rX.xyxx
 // With an unreplaced texture k = 1 and the result is unchanged.
 constexpr uint32_t kOpDiv = 14, kOpMul = 56, kOpSampleL = 72, kOpResinfo = 61,
-                   kOpDclTemps = 104;
+                   kOpDclTemps = 104, kOpRoundNi = 65, kOpMin = 51, kOpMax = 52, kOpAddI = 0,
+                   kOpNe = 57, kOpOr = 60, kOpMovc = 55;
 
 // Operand reads one component: select1 (.x) or a replicated swizzle (.xxxx).
 bool IsScalarSel(uint32_t tok) {
@@ -329,6 +330,13 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
   struct Hit {
     size_t mul, div;
     uint32_t res;
+    bool smooth;  // "round_ni; add 0.5" between mul and div: replace by a clamp
+    // index-map lookup of the same block ("mul R.xy, vUV.xyxx, cbI.xyxx" + sample_l tI):
+    // used for the direct mode (whole hi-res image when the index map is a stand-in)
+    const uint32_t* uv;
+    uint32_t uvLen;
+    const uint32_t* cbI;
+    uint32_t idxRes;
   };
   std::vector<Hit> hits;
   for (size_t k = 1; k < ins.size(); ++k) {
@@ -346,7 +354,26 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
       if (m.op == kOpMul && m.nops == 3 && m.otype[0] == 0 && m.oidx[0] == d.oidx[0] &&
           m.otype[1] == 0 && m.otype[2] == 8 && m.olen[2] == 3 &&
           !(m.ops[2][0] & 0x80000000u) && IsScalarSel(m.ops[2][0])) {
-        hits.push_back({j, k - 1, s.oidx[2]});
+        bool sm = j + 3 == k - 1 && ins[j + 1].op == kOpRoundNi && ins[j + 2].op == kOpAddI;
+        Hit hit = {j, k - 1, s.oidx[2], sm, nullptr, 0, nullptr, 0};
+        // index lookup: the last "mul R, v.xyxx, cb.xyxx" before an index sample_l
+        for (size_t q = j; q-- > 0 && q + 60 >= j;) {
+          const Ins& im = ins[q];
+          if (im.op == kOpMul && im.nops == 3 && im.otype[1] == 1 && im.otype[2] == 8 &&
+              im.olen[2] == 3 && !(im.ops[2][0] & 0x80000000u) && im.olen[1] <= 3) {
+            for (size_t r = q + 1; r < j; ++r)
+              if (ins[r].op == kOpSampleL && ins[r].nops >= 3 && ins[r].otype[2] == 7 &&
+                  ins[r].oidx[2] != s.oidx[2]) {
+                hit.uv = im.ops[1];
+                hit.uvLen = im.olen[1];
+                hit.cbI = im.ops[2];
+                hit.idxRes = ins[r].oidx[2];
+                break;
+              }
+            break;
+          }
+        }
+        hits.push_back(hit);
         break;
       }
     }
@@ -380,9 +407,14 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
     const Ins& in = ins[k];
     if ((int)k == tempsAt) {
       o.push_back(in.p[0]);
-      o.push_back(rX + 1);
+      o.push_back(rX + 2);  // rX: real size / tile size, rX+1: tile clamp
       continue;
     }
+    // smooth sampling: drop "round_ni R; add R, 0.5" of a smooth hit (re-emitted below)
+    bool skip = false;
+    for (const Hit& hh : hits)
+      if (hh.smooth && (k == hh.mul + 1 || k == hh.mul + 2)) skip = true;
+    if (skip) continue;
     if (h < hits.size() && k == hits[h].mul) {
       const Ins& d = ins[hits[h].div];
       uint32_t cbSlot = d.ops[2][1], cbElem = d.ops[2][2];
@@ -401,6 +433,43 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
       o.insert(o.end(), in.ops[0], in.ops[0] + in.olen[0]);
       o.insert(o.end(), in.ops[1], in.ops[1] + in.olen[1]);
       o.insert(o.end(), {0x0010002Au, rX});
+      if (hits[h].smooth) {
+        // Filter inside the tile instead of fetching the nearest texel:
+        //   rY.xy = floor(R / T) * T            tile origin
+        //   R = max(R, origin + 0.5); R = min(R, origin + T - 0.5)
+        // At integer ratios the sample points are texel centres (unchanged look).
+        uint32_t rY = rX + 1;
+        const uint32_t* dR = in.ops[0];  // R.xy (dest)
+        const uint32_t* sR = in.ops[1];  // R.xyxx (source)
+        uint32_t ld = in.olen[0], ls = in.olen[1];
+        // div rY.xy, R.xyxx, rX.zzzz
+        o.push_back(kOpDiv | ((1 + 2 + ls + 2) << 24));
+        o.insert(o.end(), {0x00100032u, rY});
+        o.insert(o.end(), sR, sR + ls);
+        o.insert(o.end(), {0x00100AA6u, rX});
+        // round_ni rY.xy, rY.xyxx
+        o.insert(o.end(), {kOpRoundNi | (5u << 24), 0x00100032u, rY, 0x00100046u, rY});
+        // mul rY.xy, rY.xyxx, rX.zzzz
+        o.insert(o.end(), {kOpMul | (7u << 24), 0x00100032u, rY, 0x00100046u, rY, 0x00100AA6u, rX});
+        // add rY.zw, rY.xxxy, l(0.5)
+        uint32_t half = 0x3F000000u, mhalf = 0xBF000000u;
+        o.insert(o.end(), {kOpAddI | (10u << 24), 0x001000C2u, rY, 0x00100406u, rY, 0x00004002u,
+                           half, half, half, half});
+        // max R.xy, R.xyxx, rY.zwzz
+        o.push_back(kOpMax | ((1 + ld + ls + 2) << 24));
+        o.insert(o.end(), dR, dR + ld);
+        o.insert(o.end(), sR, sR + ls);
+        o.insert(o.end(), {0x00100AE6u, rY});
+        // add rY.xy, rY.xyxx, rX.zzzz ; add rY.xy, rY.xyxx, l(-0.5)
+        o.insert(o.end(), {kOpAddI | (7u << 24), 0x00100032u, rY, 0x00100046u, rY, 0x00100AA6u, rX});
+        o.insert(o.end(), {kOpAddI | (10u << 24), 0x00100032u, rY, 0x00100046u, rY, 0x00004002u,
+                           mhalf, mhalf, mhalf, mhalf});
+        // min R.xy, R.xyxx, rY.xyxx
+        o.push_back(kOpMin | ((1 + ld + ls + 2) << 24));
+        o.insert(o.end(), dR, dR + ld);
+        o.insert(o.end(), sR, sR + ls);
+        o.insert(o.end(), {0x00100046u, rY});
+      }
       continue;
     }
     if (h < hits.size() && k == hits[h].div) {
@@ -410,6 +479,21 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
       o.insert(o.end(), in.ops[0], in.ops[0] + in.olen[0]);
       o.insert(o.end(), in.ops[1], in.ops[1] + in.olen[1]);
       o.insert(o.end(), {0x00100046u, rX});
+      if (hits[h].uv) {
+        // Direct mode: if the bound index map is not the size the engine expects (our 1x1
+        // stand-in), the data texture is the whole hi-res image: sample it at the UV.
+        uint32_t rY = rX + 1;
+        o.insert(o.end(), {kOpResinfo | (7u << 24), 0x001000F2u, rY, 0x00004001u, 0u, 0x00107E46u,
+                           hits[h].idxRes});
+        o.insert(o.end(), {kOpNe | (8u << 24), 0x00100032u, rY, 0x00100046u, rY});
+        o.insert(o.end(), hits[h].cbI, hits[h].cbI + 3);
+        o.insert(o.end(), {kOpOr | (7u << 24), 0x00100012u, rY, 0x0010000Au, rY, 0x0010001Au, rY});
+        o.push_back(kOpMovc | ((1 + in.olen[0] + 2 + hits[h].uvLen + in.olen[1]) << 24));
+        o.insert(o.end(), in.ops[0], in.ops[0] + in.olen[0]);
+        o.insert(o.end(), {0x00100006u, rY});
+        o.insert(o.end(), hits[h].uv, hits[h].uv + hits[h].uvLen);
+        o.insert(o.end(), in.ops[1], in.ops[1] + in.olen[1]);
+      }
       ++h;
       continue;
     }
@@ -488,6 +572,19 @@ UINT BCBlockBytes(DXGI_FORMAT f) {
   }
 }
 
+// Index maps of "-index" tile sprites (R8 / R16): replaced by a 1x1 stand-in when the
+// sprite's data texture is replaced by the whole hi-res image ("null" in the manifest).
+UINT IndexBytes(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT:
+      return 1;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
 // FNV-1a over mip 0 in the DDS file's byte order (BGRA), whatever the upload order.
 // Diagnostics: which render target is each replaced texture drawn into?
 std::unordered_map<void*, std::wstring> g_artTex;  // replaced texture -> file name
@@ -496,6 +593,13 @@ std::unordered_set<std::wstring> g_artBoundLogged;
 uint64_t HashMip0(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* init) {
   uint64_t h = 0xCBF29CE484222325ull;
   auto p = static_cast<const uint8_t*>(init->pSysMem);
+  if (UINT ib = IndexBytes(d->Format)) {  // index maps: raw rows
+    for (UINT y = 0; y < d->Height; ++y) {
+      const uint8_t* r = p + (size_t)y * init->SysMemPitch;
+      for (size_t x = 0; x < (size_t)d->Width * ib; ++x) h = (h ^ r[x]) * 0x100000001B3ull;
+    }
+    return h;
+  }
   if (UINT bs = BCBlockBytes(d->Format)) {  // raw blocks, row by block row
     UINT bw = (d->Width + 3) / 4, bh = (d->Height + 3) / 4;
     for (UINT y = 0; y < bh; ++y) {
@@ -606,10 +710,30 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
     Log("overlay RT scaling failed (0x%08lx), using original size", (unsigned long)hr);
   }
   if (d && init && init->pSysMem && out && d->ArraySize == 1 &&
-      (IsBGRA(d->Format) || IsRGBA(d->Format) || BCBlockBytes(d->Format)) &&
+      (IsBGRA(d->Format) || IsRGBA(d->Format) || BCBlockBytes(d->Format) ||
+       IndexBytes(d->Format)) &&
       g_artSizes.count(((uint64_t)d->Width << 32) | d->Height)) {
     uint64_t h = HashMip0(d, init);
     auto it = g_art.find(h);
+    if (it != g_art.end() && it->second.file.size() >= 4 &&
+        it->second.file.compare(it->second.file.size() - 4, 4, L"null") == 0) {
+      // 1x1 stand-in index map: the patched sprite shader then samples the (whole,
+      // hi-res) data texture directly
+      D3D11_TEXTURE2D_DESC sd = *d;
+      sd.Width = sd.Height = 1;
+      sd.MipLevels = 1;
+      uint32_t zero = 0;
+      D3D11_SUBRESOURCE_DATA one = {&zero, 4, 0};
+      HRESULT hr = g_origCreateTex2D(dev, &sd, &one, out);
+      if (SUCCEEDED(hr)) {
+        if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0)
+          Log("UI art replaced #%d: %ux%u index map -> 1x1 stand-in", g_artReplaced, d->Width,
+              d->Height);
+        return hr;
+      }
+      Log("index stand-in creation failed 0x%08lx", (unsigned long)hr);
+      return g_origCreateTex2D(dev, d, init, out);
+    }
     if (it == g_art.end()) {
       if (g_artMisses++ < 40) {
         auto p = static_cast<const uint8_t*>(init->pSysMem);
@@ -1189,53 +1313,95 @@ bool g_vtHooked = false;
 
 // DXVK shares one method table per class, so hooking the tables of a throwaway
 // device covers the game's device and contexts too.
-void HookD3DVtables() {
-  if (g_vtHooked) return;
+// Installs the method-table hooks from a device and its immediate context. DXVK (and
+// d3d11.dll) share one table per class, so this covers every device / context.
+bool g_d3dOk = false;  // method-table hooks are in place
+
+void HookFromDevice(ID3D11Device* dev, ID3D11DeviceContext* imm, const char* how) {
+  if (g_vtHooked || !dev) return;
   g_vtHooked = true;
-  HMODULE d3d = GetModuleHandleA("d3d11.dll");
-  using CreateDeviceFn =
-      HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*,
-                       UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
-  auto create = reinterpret_cast<CreateDeviceFn>(
-      d3d ? GetProcAddress(d3d, "D3D11CreateDevice") : nullptr);
-  if (!create) {
-    Log("d3d11 not available - clip fix disabled");
-    return;
-  }
-  ID3D11Device* dev = nullptr;
-  ID3D11DeviceContext* imm = nullptr;
-  HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                      D3D11_SDK_VERSION, &dev, nullptr, &imm);
-  if (FAILED(hr) || !dev) {
-    Log("helper D3D11 device failed (0x%08lx) - clip fix disabled", (unsigned long)hr);
-    return;
-  }
+  g_d3dOk = true;
   PatchVt(*reinterpret_cast<void***>(dev), kVtCreatePS, (void*)&HookCreatePS,
           reinterpret_cast<void**>(&g_origCreatePS));
   float s = ConfiguredScale();
-  if (g_cfg.aiArt && s >= 1.25f) LoadArtManifest(s > 2.5f ? L"x3" : L"x2");
-  {
-    if (!g_art.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
-      PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
-              reinterpret_cast<void**>(&g_origCreateTex2D));
+  if (g_cfg.aiArt && s >= 1.25f) {
+    if (s > 2.5f) LoadArtManifest(L"x3");
+    if (g_art.empty()) LoadArtManifest(L"x2");  // releases ship 2x only
   }
-
+  if (!g_art.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
+    PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
+            reinterpret_cast<void**>(&g_origCreateTex2D));
   if (imm) HookContextVt(imm);
   ID3D11DeviceContext* def = nullptr;
   if (SUCCEEDED(dev->CreateDeferredContext(0, &def)) && def) {
     HookContextVt(def);
     def->Release();
   }
-  if (imm) imm->Release();
-  dev->Release();
-  Log("D3D11 hooks installed (CreatePixelShader, PSSetShader x%d)", g_ctxVt[1] ? 2 : 1);
+  Log("D3D11 hooks installed via %s (CreatePixelShader, PSSetShader x%d)", how,
+      g_ctxVt[1] ? 2 : 1);
 }
 
-// The game creates its window before its D3D device: install the D3D hooks then.
+// Primary path: the game's own D3D11CreateDevice (import table of the exe).
+using CreateDeviceFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
+                                        const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**,
+                                        D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+CreateDeviceFn g_origCreateDevice = nullptr;
+
+HRESULT WINAPI HookD3D11CreateDevice(IDXGIAdapter* ad, D3D_DRIVER_TYPE dt, HMODULE sw, UINT fl,
+                                     const D3D_FEATURE_LEVEL* lv, UINT nlv, UINT sdk,
+                                     ID3D11Device** dev, D3D_FEATURE_LEVEL* got,
+                                     ID3D11DeviceContext** imm) {
+  HRESULT hr = g_origCreateDevice(ad, dt, sw, fl, lv, nlv, sdk, dev, got, imm);
+  if (SUCCEEDED(hr) && dev && *dev && IsActive()) {
+    ID3D11DeviceContext* ctx = imm ? *imm : nullptr;
+    if (!ctx) (*dev)->GetImmediateContext(&ctx);
+    HookFromDevice(*dev, ctx, "the game's device");
+    if (!imm && ctx) ctx->Release();
+  }
+  return hr;
+}
+
+// A throwaway helper device: DXVK / d3d11.dll share one method table per class, so its
+// tables are the game's. Creating it can fail transiently (e.g. under gamescope with
+// little free VRAM), so it is retried; the caller decides when to give up.
+int g_helperFailures = 0;
+void HookD3DVtables(int attempts) {
+  if (g_vtHooked) return;
+  if (g_cfg.testSafeMode) {
+    if (g_helperFailures++ == 0) Log("TestSafeMode: simulating a hook failure");
+    return;
+  }
+  HMODULE d3d = GetModuleHandleA("d3d11.dll");
+  if (!d3d) d3d = LoadLibraryA("d3d11.dll");
+  auto create = reinterpret_cast<CreateDeviceFn>(
+      d3d ? GetProcAddress(d3d, "D3D11CreateDevice") : nullptr);
+  if (!create) {
+    if (g_helperFailures++ == 0) Log("d3d11 not available");
+    return;
+  }
+  ID3D11Device* dev = nullptr;
+  ID3D11DeviceContext* imm = nullptr;
+  HRESULT hr = E_FAIL;
+  for (int attempt = 0; attempt < attempts && FAILED(hr); ++attempt) {
+    if (attempt) Sleep(150);
+    hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                &dev, nullptr, &imm);
+  }
+  if (FAILED(hr) || !dev) {
+    if (g_helperFailures++ < 5)
+      Log("helper D3D11 device failed (0x%08lx), will retry", (unsigned long)hr);
+    return;
+  }
+  HookFromDevice(dev, imm, "a helper device");
+  if (imm) imm->Release();
+  dev->Release();
+}
+
 HWND WINAPI HookCreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y,
                                 int w, int h, HWND parent, HMENU menu, HINSTANCE inst,
                                 LPVOID param) {
-  if (IsActive()) HookD3DVtables();
+  // before the game creates its device, shaders and textures: everything is hooked
+  if (IsActive()) HookD3DVtables(8);
   return g_origCreateWindowExA(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
 }
 }  // namespace
@@ -1245,10 +1411,20 @@ void InstallD3DHooks() {
   g_origCreateWindowExA = reinterpret_cast<CreateWindowExAFn>(PatchIAT(
       GetModuleHandleW(nullptr), "USER32.dll", "CreateWindowExA", (void*)&HookCreateWindowExA));
   Log("CreateWindowExA hook %s", g_origCreateWindowExA ? "ok" : "FAILED");
+  g_origCreateDevice = reinterpret_cast<CreateDeviceFn>(PatchIAT(
+      GetModuleHandleW(nullptr), "d3d11.dll", "D3D11CreateDevice", (void*)&HookD3D11CreateDevice));
+  Log("D3D11CreateDevice hook %s", g_origCreateDevice ? "ok" : "FAILED (helper device fallback)");
 }
 
-// Fallback (first frame) in case no window was created after our hooks.
+// Later chances (first frames); bounded so a broken setup does not retry forever.
 void HookD3DVtablesOnce() {
-  if (IsActive()) HookD3DVtables();
+  if (IsActive() && !g_vtHooked && g_helperFailures < 40) HookD3DVtables(1);
 }
+
+// Last attempt before the UI is laid out (core decides on safe mode right after).
+void EnsureD3DHooks() {
+  if (IsActive() && !g_vtHooked) HookD3DVtables(8);
+}
+
+bool D3DHooksReady() { return g_d3dOk; }
 }  // namespace uis

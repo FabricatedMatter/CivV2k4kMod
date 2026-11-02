@@ -28,6 +28,7 @@ Methods (chosen per texture by METHODS, first matching prefix wins):
 """
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -126,6 +127,7 @@ def method_for(name, default="box"):
 
 
 SCALES = (2, 3)
+DIRECT_MAX_TILE = 2  # sprites with tiles up to this size are replaced as whole images
 PAD = 8          # replicated border (1x px) so 9-slice edges stay seamless
 ESRGAN_SCALE = 4
 
@@ -386,11 +388,34 @@ NOT_ART = ("twcen", "arial", "atlas_environment", "missingtexture")
 
 
 ATLAS_FILES = set()  # icon atlas file names from the game's IconTextureAtlases XML
+UI_REFS = set()      # texture names mentioned by the game's XML / Lua (UI code)
+# 3D material maps, FX and lookup tables (e.g. in the Upgrade1 patch archive, which mixes
+# UI and 3D art): never UI, and AI-upscaling a lookup table or height map changes shading
+NOT_UI_3D = re.compile(r"(_[dshn]\.dds$|_diff|_sref|_spec|_height|_alpha_|_base_|_uv_|decal|^fx_|"
+                       r"^pl_|^hb_|^mod_|trading_post|quarry|^stone_|river_|waterdepth|"
+                       r"roadsandrails|shadowlight|_overlay_|_terrain_|_grnd)")
+
+
+def is_ui_texture(name, tag):
+    """UI archives are UI except for the mixed Upgrade1 archive, where a texture counts as
+    UI if the UI references it, or else does not look like a 3D material."""
+    if tag != "upgrade1":
+        return True
+    if name in UI_REFS or name in ATLAS_FILES or name.startswith(("civsymbol", "civsymbols")):
+        return True
+    return not NOT_UI_3D.search(name)
 
 
 def load_atlas_files(game):
     import glob
-    import re
+    for f in glob.glob(os.path.join(game, "Assets", "**", "*.*"), recursive=True):
+        if f.lower().endswith((".xml", ".lua")):
+            try:
+                t = open(f, encoding="latin-1").read()
+            except OSError:
+                continue
+            UI_REFS.update(os.path.basename(m.strip().lower())
+                           for m in re.findall(r"([A-Za-z0-9_\- ]+\.dds)", t))
     for f in glob.glob(os.path.join(game, "Assets", "**", "*IconTextureAtlases*.xml"),
                        recursive=True):
         t = open(f, encoding="latin-1").read()
@@ -399,6 +424,8 @@ def load_atlas_files(game):
 
 
 def in_category(cat, name, tag):
+    if not is_ui_texture(name, tag):
+        return False
     if cat == "compressed":  # any BC texture in the UI archives (format checked later)
         return is_ui(tag) and not name.startswith(NOT_ART)
     named = [c for c in CATEGORIES if c not in ("rest", "atlases", "compressed")]
@@ -448,11 +475,26 @@ def merge(out, parts):
             for line in open(m).read().splitlines():
                 if line.strip():
                     fn = line.split()[4]
-                    if src != d:
+                    if src != d and not fn.endswith(".null"):
                         shutil.copy2(os.path.join(src, fn), os.path.join(d, fn))
                     entries[fn] = line
-        open(mf, "w").write("\n".join(entries.values()) + "\n")
-        print("x%d: %d textures" % (k, len(entries)))
+        # one entry per hash (the DLL keeps one texture per hash): the newest build wins,
+        # e.g. a rebuilt G&K copy over a stale BNW copy with identical pixels
+        by_hash = {}
+        for fn, line in entries.items():
+            h = line.split()[0]
+            ref = fn[:-len(".idx.null")] + ".dds" if fn.endswith(".idx.null") else fn
+            t = os.path.getmtime(os.path.join(d, ref)) if os.path.exists(os.path.join(d, ref)) else 0
+            if h not in by_hash or t > by_hash[h][0]:
+                by_hash[h] = (t, line)
+        lines = [v[1] for v in by_hash.values()]
+        keep = {l.split()[4] for l in lines}
+        for fn in entries:
+            if fn not in keep and not fn.endswith(".null") and os.path.exists(os.path.join(d, fn)):
+                os.remove(os.path.join(d, fn))
+        open(mf, "w").write("\n".join(lines) + "\n")
+        print("x%d: %d textures (%d stale duplicates removed)" % (k, len(lines),
+                                                                len(entries) - len(lines)))
 
 
 def main():
@@ -489,6 +531,18 @@ def main():
     # "-index" tile sprites: the data texture is replaced, the index map stays (uisprite.py)
     index_maps = {(tag, n.lower()[:-len("-index.dds")]): data[off:off + size]
                   for tag, n, off, size, data in entries if n.lower().endswith("-index.dds")}
+    # distinct data textures per index map (by content): an index map may only be replaced
+    # if every sprite using it has the same data (identical copies in several archives)
+    data_by_key = {}
+    for tag_, name_, off_, size_, data_ in entries:
+        n_ = name_.lower()
+        if n_.endswith(".dds") and not n_.endswith("-index.dds") and (tag_, n_[:-4]) in index_maps:
+            data_by_key[(tag_, n_[:-4])] = data_[off_:off_ + size_]
+    index_users = {}
+    for key_, ib_ in index_maps.items():
+        h_ = fnv1a64(uisprite.index_bytes(ib_))
+        d_ = data_by_key.get(key_)
+        index_users.setdefault(h_, set()).add(hash(d_[128:]) if d_ else None)
     items, seen = [], set()
     for tag, name, off, size, data in entries:
         n = name.lower()
@@ -523,7 +577,14 @@ def main():
             if not t:
                 print("skipping %s: unknown sprite layout" % it["name"])
                 continue
-            it.update(index=idx, t=t, src=uisprite.assemble(it["data"], idx, t))
+            iraw = uisprite.index_bytes(ib)
+            ihash = fnv1a64(iraw)
+            # Direct mode for small tiles (1-2 px: the 1x index map would cap the detail):
+            # the data texture becomes the whole k x image and the index map a stand-in.
+            # Only for index maps no other sprite shares (their data may not be replaced).
+            direct = t <= DIRECT_MAX_TILE and len(index_users.get(ihash, ())) == 1
+            it.update(index=idx, t=t, src=uisprite.assemble(it["data"], idx, t),
+                      direct=direct, ihash=ihash, iw=idx.shape[1], ih=idx.shape[0])
         else:
             it["src"] = it["data"]
         if max(it["src"].shape[:2]) > a.max_size:
@@ -571,10 +632,12 @@ def main():
                 if f:
                     fits[n] = f
                 out = hi
-                if it["index"] is not None:
+                if it["index"] is not None and it.get("direct"):
+                    pass  # whole k x image; the index map is replaced by a stand-in
+                elif it["index"] is not None:
                     fallback = np.repeat(np.repeat(it["data"], k, 0), k, 1)
                     out = uisprite.disassemble(hi, it["index"], it["t"], k, it["data"].shape,
-                                               fallback)
+                                               fallback, it["data"])
                 fn = n[:-4] + "_x%d.dds" % k
                 if it["bc"]:
                     bcn.encode_dds(os.path.join(d, fn), out, it["bc"])
@@ -584,6 +647,9 @@ def main():
                 else:
                     write_dds_bgra(os.path.join(d, fn), mip_chain(out))
                 manifest.append("%016x %d %d %d %s" % (fnv1a64(px), w, h, k, fn))
+                if it.get("direct"):
+                    manifest.append("%016x %d %d %d %s" % (it["ihash"], it["iw"], it["ih"], k,
+                                                          fn[:-4] + ".idx.null"))
                 if k == 2:
                     psnr, amae, bad = metrics(orig, hi)
                     stair = staircase(orig, hi, k)
@@ -601,8 +667,9 @@ def main():
             keep = []
             if os.path.exists(mf):
                 mine = {l.split()[4] for l in manifest}
+                hashes = {l.split()[0] for l in manifest}
                 keep = [l for l in open(mf).read().splitlines()
-                        if l.strip() and l.split()[4] not in mine]
+                        if l.strip() and l.split()[4] not in mine and l.split()[0] not in hashes]
             open(mf, "w").write("\n".join(keep + manifest) + "\n")
         print("chunk %d-%d of %d done" % (c0, c0 + len(citems), len(items)), flush=True)
     if rows:

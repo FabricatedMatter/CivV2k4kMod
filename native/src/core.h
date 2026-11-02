@@ -6,6 +6,8 @@ bool InstallCore();  // signature scan + hooks; false => mod stays inert
 
 bool IsActive();
 float EffectiveScale();
+// Non-null if the mod had to fall back to safe mode (shown in the options menu).
+const char* Warning();
 // Scale the settings ask for (valid before the first resolution apply).
 float ConfiguredScale();
 float AutoScale();

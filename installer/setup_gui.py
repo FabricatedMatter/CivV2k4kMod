@@ -21,7 +21,6 @@ OK = "#4cc38a"
 WARN = "#e5a23a"
 ERR = "#e5534b"
 
-SCALES = {"1440p – 4K   ·   2×": 2, "5K and up   ·   3×": 3}
 
 
 def linux_dpi_scale():
@@ -99,20 +98,6 @@ class SetupApp(ctk.CTk):
         self.game.bind("<KeyRelease>", lambda _: self.refresh_game())
         self.ghost(row, "Browse", self.browse_game, width=96).pack(side="left", padx=(10, 0))
         self.game_status = self.status_line(card)
-
-        # display card
-        card = self.card(body, "Display")
-        row = ctk.CTkFrame(card, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(0, 16))
-        self.scale_value = core.detect_scale(self.winfo_screenheight())
-        self.scale_btns = {}
-        for i, (label, k) in enumerate(SCALES.items()):
-            b = ctk.CTkButton(row, text=label, height=40, corner_radius=10, font=self.f_body,
-                              command=lambda k=k: self.pick_scale(k))
-            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
-            row.grid_columnconfigure(i, weight=1, uniform="scale")
-            self.scale_btns[k] = b
-        self.pick_scale(self.scale_value)
 
         # font card
         card = self.card(body, "Font")
@@ -233,13 +218,6 @@ class SetupApp(ctk.CTk):
             self.use_font.configure(state="disabled", button_color=MUTED)
             self.font_info.configure(text=core.FONT_HINT, text_color=MUTED)
 
-    def pick_scale(self, k):
-        self.scale_value = k
-        for kk, b in self.scale_btns.items():
-            on = kk == k
-            b.configure(fg_color=GOLD if on else FIELD, hover_color=GOLD_HOVER if on else CARD_BORDER,
-                        text_color=GOLD_TEXT if on else TEXT)
-
     def browse_game(self):
         d = filedialog.askdirectory(title="Select the Sid Meier's Civilization V folder")
         if d:
@@ -311,7 +289,7 @@ class SetupApp(ctk.CTk):
         if not self.refresh_game():
             return
         game = self.game.get().strip()
-        scale = self.scale_value
+        scale = 2  # 2x art: 1:1 at 4K, also used for 1440p and above 4K
         font = self.font_path if self.use_font.get() else None
         self.run(lambda: core.install(game, scale, font, log=self.log,
                                       progress=self.set_progress), "Installed. Enjoy!")

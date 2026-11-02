@@ -54,7 +54,9 @@ static void Init() {
     // Hi-res font atlases (tools/fontgen.py): 2x up to 250 %, 3x above.
     float s = ConfiguredScale();
     if (g_cfg.crispFonts && s >= 1.25f) {
-      const wchar_t* k = s > 2.5f ? L"x3" : L"x2";
+      // 3x only if installed (releases ship 2x, which is also fine above 250 %)
+      const wchar_t* k = s > 2.5f && GetFileAttributesW((g_modDir + L"\\Fonts\\x3").c_str()) !=
+                                         INVALID_FILE_ATTRIBUTES ? L"x3" : L"x2";
       roots.push_back(g_modDir + L"\\Fonts\\" + k);
       Log("crisp fonts: using %ls atlases for scale %.2f", k, s);
     }

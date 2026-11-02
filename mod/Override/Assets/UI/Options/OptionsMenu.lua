@@ -1640,6 +1640,13 @@ local function UIScaleCommit()
 	end
 end
 
+-- Safe mode: the DLL could not hook the graphics this session; say so where the scale lives.
+local g_uisWarning = UIScale ~= nil and UIScale.GetWarning ~= nil and UIScale.GetWarning() or nil;
+if g_uisWarning then
+	Controls.UIScaleWarning:SetText("[COLOR_WARNING_TEXT]" .. g_uisWarning .. "[ENDCOLOR]");
+	Controls.UIScaleWarning:SetHide(false);
+end
+
 if UIScaleAvailable() then
 	Controls.UIScaleBlock:SetHide(false);
 	Controls.UIScaleBlock:CalculateSize();

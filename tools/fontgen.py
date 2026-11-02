@@ -150,16 +150,24 @@ def layer_kind(stem):
 
 
 def write_dds_a8(path, img):
+    """A8 DDS with a full mip chain: at UI scales between 100 % and 200 % the 2x atlas is
+    drawn smaller than its size, and without mips the glyphs alias."""
+    levels = [np.ascontiguousarray(img, np.uint8)]
+    while levels[-1].shape[0] > 1 or levels[-1].shape[1] > 1:
+        cur = levels[-1]
+        levels.append(np.asarray(Image.fromarray(cur).resize(
+            (max(1, cur.shape[1] // 2), max(1, cur.shape[0] // 2)), Image.BOX)))
     h, w = img.shape
     hdr = bytearray(128)
-    struct.pack_into("<4sIIIIIII", hdr, 0, b"DDS ", 124, 0x1 | 0x2 | 0x4 | 0x1000 | 0x8,
-                     h, w, w, 0, 1)
+    struct.pack_into("<4sIIIIIII", hdr, 0, b"DDS ", 124,
+                     0x1 | 0x2 | 0x4 | 0x1000 | 0x8 | 0x20000, h, w, w, 0, len(levels))
     # DDS_PIXELFORMAT at 76: size, flags=ALPHA(0x2), fourcc, bits, r,g,b,a masks
     struct.pack_into("<IIIIIIII", hdr, 76, 32, 0x2, 0, 8, 0, 0, 0, 0xFF)
-    struct.pack_into("<I", hdr, 108, 0x1000)  # caps: TEXTURE
+    struct.pack_into("<I", hdr, 108, 0x1000 | 0x8 | 0x400000)  # TEXTURE | COMPLEX | MIPMAP
     with open(path, "wb") as f:
         f.write(hdr)
-        f.write(np.ascontiguousarray(img, np.uint8).tobytes())
+        for lv in levels:
+            f.write(lv.tobytes())
 
 
 def upscale_smooth(a, k):

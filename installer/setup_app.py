@@ -44,8 +44,6 @@ def cli(a):
         core.uninstall(game)
         return
     scale = a.scale or 2
-    if not a.yes and not a.scale:
-        scale = int(ask("Art scale: 2 for 1440p-4K, 3 for 5K and up", "2"))
     font = None if a.no_font else (a.font or core.find_font())
     if font and not a.yes and not a.font:
         if (ask("Use your installed Tw Cen MT (%s)? y/n" % font, "y") or "y").lower() != "y":
@@ -74,7 +72,6 @@ def gui():
 
     games = core.locate.find_games()
     game_var = tk.StringVar(value=games[0][0] if games else "")
-    scale_var = tk.IntVar(value=core.detect_scale(root.winfo_screenheight()))
     font_path = tk.StringVar(value="")
     use_font = tk.BooleanVar(value=False)
 
@@ -99,14 +96,6 @@ def gui():
     ttk.Button(f, text="Browse...", command=browse_game).pack(side="left", padx=6)
     game_status = ttk.Label(root, text="")
     game_status.pack(anchor="w", padx=16)
-
-    # scale
-    f = ttk.LabelFrame(root, text="Screen")
-    f.pack(fill="x", **pad)
-    ttk.Radiobutton(f, text="1440p - 4K  (2x art)", variable=scale_var, value=2).pack(
-        anchor="w", padx=6)
-    ttk.Radiobutton(f, text="5K and above  (3x art)", variable=scale_var, value=3).pack(
-        anchor="w", padx=6)
 
     # font
     f = ttk.LabelFrame(root, text="Font")
@@ -199,7 +188,7 @@ def gui():
     def do_install():
         if not check_game():
             return
-        run(lambda: core.install(game_var.get(), scale_var.get(),
+        run(lambda: core.install(game_var.get(), 2,
                                  font_path.get() if use_font.get() else None,
                                  log=log, progress=progress))
 
@@ -217,7 +206,7 @@ def main():
     ap = argparse.ArgumentParser(description=TITLE)
     ap.add_argument("--cli", action="store_true", help="text mode")
     ap.add_argument("--game")
-    ap.add_argument("--scale", type=int, choices=[2, 3])
+    ap.add_argument("--scale", type=int, choices=[2, 3], help=argparse.SUPPRESS)
     ap.add_argument("--font", help="path of your Tw Cen MT .ttf")
     ap.add_argument("--no-font", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
