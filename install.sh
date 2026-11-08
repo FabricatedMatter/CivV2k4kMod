@@ -43,6 +43,9 @@ if [[ -d "$HERE/build/UIArt" ]]; then
 fi
 
 echo "Installed to: $GAME"
+if [[ -d "$GAME/Assets/DLC/UI_bc1" ]]; then
+  echo "Enhanced UI detected: the UI Scale slider is added to EUI's options menu automatically."
+fi
 echo
 echo "Set the Steam launch options for Civilization V to:"
 echo '  WINEDLLOVERRIDES="version=n,b" %command%'

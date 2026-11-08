@@ -2,7 +2,8 @@
 
 Installs into the game folder, adding files only:
     version.dll                      the mod (refuses to replace a foreign version.dll)
-    UIScale/Override/...             the modified options menu
+    UIScale/Override/...             the UI Scale options (the DLL patches them into the
+                                     options menu at startup, also EUI's)
     UIScale/UIArt/x<k>/              hi-res UI art, unlocked from the art pack with the
     UIScale/Fonts/x<k>/              player's own game files (see tools/pack.py)
 Optionally the fonts are rendered from the player's own copy of Tw Cen MT instead.
@@ -187,6 +188,9 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
     if use_font:
         log("Rendering fonts from %s ..." % use_font)
         render_fonts(game, dst, scale, use_font, log)
+    if os.path.isdir(os.path.join(game, "Assets", "DLC", "UI_bc1")):
+        log("Enhanced UI detected: the UI Scale slider is added to EUI's options menu "
+            "automatically.")
     if sys.platform != "win32":
         notes.append('Steam: right-click Civilization V > Properties > Launch Options:\n'
                      '    WINEDLLOVERRIDES="version=n,b" %command%')

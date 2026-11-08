@@ -7,11 +7,20 @@
 //   UIScale.GetRealSize()     -> w, h
 //   UIScale.GetVirtualSize()  -> w, h
 //   UIScale.Set(n [, apply])  -> stores the setting (0 = auto); applies live unless apply == false
+// Screenshot automation (tools/shots.py; only with Shots=<run> in UIScale.ini):
+//   UIScale.ShotConfig()      -> run, save path, scales string, camera target (nil if off)
+//   UIScale.Shot(name)        -> logs "SHOT <name>"; the host script captures the screen
+//   UIScale.ShotsDone()       -> logs "SHOTS DONE"
+//   UIScale.PostKey(vk)       -> key press posted to the game window (e.g. 27 = Escape)
+//   UIScale.ShotNote(text)    -> logs "SHOTNOTE <text>" (shown to the user by shots.py)
+//   UIScale.LockMouse()       -> ignore the real mouse, park the cursor (core.h)
+//   UIScale.UnlockMouse()     -> real mouse back (also automatic when Shots= is removed)
 #include "lua_bridge.h"
 
 #include <windows.h>
 
 #include <cstring>
+#include <string>
 
 #include "config.h"
 #include "core.h"
@@ -36,6 +45,7 @@ struct LuaApi {
   int(__cdecl* type)(lua_State*, int);
   void(__cdecl* pushstring)(lua_State*, const char*);
   void(__cdecl* rawset)(lua_State*, int);
+  const char*(__cdecl* tolstring)(lua_State*, int, size_t*);
 } L_;
 
 using OpenLibsFn = void(__cdecl*)(lua_State*);
@@ -95,16 +105,101 @@ int __cdecl l_Set(lua_State* L) {
   return 0;
 }
 
+std::string Utf8(const std::wstring& w) {
+  char buf[1024];
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, buf, sizeof buf, nullptr, nullptr);
+  return n > 0 ? buf : "";
+}
+
+// First string argument (UIScale.F(x) or UIScale:F(x)).
+const char* StrArg(lua_State* L) {
+  int idx = L_.gettop(L) >= 2 && L_.type(L, 1) == 5 /*LUA_TTABLE*/ ? 2 : 1;
+  return L_.tolstring ? L_.tolstring(L, idx, nullptr) : nullptr;
+}
+
+int __cdecl l_ShotConfig(lua_State* L) {
+  if (g_cfg.shots.empty()) return 0;
+  std::wstring save = g_cfg.shotSave;
+  if (!save.empty() && save.find(L'\\') == std::wstring::npos && save.find(L':') == std::wstring::npos) {
+    save = g_userDir + L"\\Saves\\single\\" + save;
+    if (save.size() < 10 || _wcsicmp(save.c_str() + save.size() - 10, L".Civ5Save") != 0)
+      save += L".Civ5Save";
+  }
+  L_.pushstring(L, Utf8(g_cfg.shots).c_str());
+  L_.pushstring(L, Utf8(save).c_str());
+  L_.pushstring(L, Utf8(g_cfg.shotScales.empty() ? L"0" : g_cfg.shotScales).c_str());
+  L_.pushstring(L, Utf8(g_cfg.shotLook).c_str());
+  return 4;
+}
+
+int __cdecl l_Shot(lua_State* L) {
+  const char* n = StrArg(L);
+  if (!g_cfg.shots.empty() && n) Log("SHOT %s", n);
+  return 0;
+}
+
+int __cdecl l_ShotNote(lua_State* L) {
+  const char* n = StrArg(L);
+  if (!g_cfg.shots.empty() && n) Log("SHOTNOTE %s", n);
+  return 0;
+}
+
+int __cdecl l_LockMouse(lua_State* L) {
+  LockMouseForShots();
+  return 0;
+}
+
+int __cdecl l_UnlockMouse(lua_State* L) {
+  UnlockMouseForShots();
+  return 0;
+}
+
+int __cdecl l_ShotsDone(lua_State* L) {
+  if (!g_cfg.shots.empty()) Log("SHOTS DONE");
+  return 0;
+}
+
+BOOL CALLBACK FindGameWindow(HWND h, LPARAM out) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(h, &pid);
+  if (pid != GetCurrentProcessId() || !IsWindowVisible(h)) return TRUE;
+  RECT r, best;
+  GetWindowRect(h, &r);
+  HWND* o = reinterpret_cast<HWND*>(out);
+  if (*o) GetWindowRect(*o, &best);
+  if (!*o || (r.right - r.left) * (r.bottom - r.top) > (best.right - best.left) * (best.bottom - best.top))
+    *o = h;
+  return TRUE;
+}
+
+int __cdecl l_PostKey(lua_State* L) {
+  if (g_cfg.shots.empty()) return 0;
+  int idx = L_.gettop(L) >= 2 && L_.type(L, 1) == 5 ? 2 : 1;
+  WPARAM vk = (WPARAM)L_.tonumber(L, idx);
+  HWND h = nullptr;
+  EnumWindows(FindGameWindow, reinterpret_cast<LPARAM>(&h));
+  if (h && vk) {
+    UINT sc = MapVirtualKeyW((UINT)vk, 0 /*MAPVK_VK_TO_VSC*/);
+    PostMessageW(h, WM_KEYDOWN, vk, 1 | (sc << 16));
+    PostMessageW(h, WM_KEYUP, vk, 1 | (sc << 16) | (1u << 30) | (1u << 31));
+  }
+  return 0;
+}
+
 // Pushes a new UIScale table onto the stack.
 void PushTable(lua_State* L) {
-  L_.createtable(L, 0, 8);
+  L_.createtable(L, 0, 15);
   struct {
     const char* name;
     lua_CFunction fn;
   } fns[] = {{"IsActive", l_IsActive},       {"Get", l_Get},
              {"GetSetting", l_GetSetting},   {"GetAuto", l_GetAuto},
              {"GetRealSize", l_GetRealSize}, {"GetVirtualSize", l_GetVirtualSize},
-             {"Set", l_Set},                 {"GetWarning", l_GetWarning}};
+             {"Set", l_Set},                 {"GetWarning", l_GetWarning},
+             {"ShotConfig", l_ShotConfig},   {"Shot", l_Shot},
+             {"ShotsDone", l_ShotsDone},     {"PostKey", l_PostKey},
+             {"ShotNote", l_ShotNote},       {"LockMouse", l_LockMouse},
+             {"UnlockMouse", l_UnlockMouse}};
   for (auto& f : fns) {
     L_.pushcclosure(L, f.fn, 0);
     L_.setfield(L, -2, f.name);
@@ -171,6 +266,7 @@ bool InstallLuaBridge() {
   R(type, "lua_type");
   R(pushstring, "lua_pushstring");
   R(rawset, "lua_rawset");
+  R(tolstring, "lua_tolstring");  // optional (screenshot automation only)
 #undef R
   if (!L_.pushcclosure || !L_.setfield || !L_.createtable || !L_.pushnumber ||
       !L_.pushboolean || !L_.tonumber || !L_.toboolean || !L_.gettop || !L_.type || !L_.pushstring || !L_.rawset) {

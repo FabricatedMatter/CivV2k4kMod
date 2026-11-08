@@ -190,7 +190,56 @@ void TracePos(const char* where, UINT m, LPARAM l) {
   Log("pos -> %.0f,%.0f  [%s msg 0x%x lp %d,%d]", x, y, where, m, GET_X_LPARAM(l), GET_Y_LPARAM(l));
 }
 
+// Screenshot mouse lock (UIScale.LockMouse, only with Shots=<run>): real mouse input is
+// ignored and the game's cursor stays parked at a fixed client position, so a pointer
+// that left the window cannot edge-scroll the map or open tooltips between shots.
+bool g_mouseLock = false;
+float g_parkFx = 0.98f, g_parkFy = 0.97f;  // fraction of the client area
+
+bool ParkPoint(POINT* client) {
+  RECT rc;
+  if (!g_gameHwnd || !GetClientRect(g_gameHwnd, &rc) || rc.right <= 0) return false;
+  client->x = (LONG)(rc.right * g_parkFx);
+  client->y = (LONG)(rc.bottom * g_parkFy);
+  return true;
+}
+
+// Called every frame while locked: the game's stored cursor (UI units) = park point.
+void EnforceMouseLock() {
+  // The lock lasts only while tools/shots.py runs: it restores UIScale.ini (no Shots=)
+  // when it finishes, fails or is interrupted.
+  static DWORD lastCheck = 0;
+  DWORD now = GetTickCount();
+  if (now - lastCheck > 1000) {
+    lastCheck = now;
+    if (!ShotsStillRequested()) {
+      g_mouseLock = false;
+      Log("screenshot mouse lock off (Shots= no longer set)");
+      return;
+    }
+  }
+  POINT p;
+  uint8_t* obj = UiObj();
+  if (!g_mouseLock || !obj || !ParkPoint(&p)) return;
+  float s = g_scale > 0 ? g_scale : 1.0f;
+  *reinterpret_cast<float*>(obj + 0x654) = floorf(p.x / s);
+  *reinterpret_cast<float*>(obj + 0x658) = floorf(p.y / s);
+}
+
+using GetCursorInfoFn = BOOL(WINAPI*)(PCURSORINFO);
+GetCursorInfoFn g_origGetCursorInfo = nullptr;
+BOOL WINAPI HookGetCursorInfo(PCURSORINFO ci) {
+  BOOL r = g_origGetCursorInfo(ci);
+  POINT p;
+  if (r && ci && g_mouseLock && ParkPoint(&p)) {
+    ClientToScreen(g_gameHwnd, &p);
+    ci->ptScreenPos = p;
+  }
+  return r;
+}
+
 LRESULT CALLBACK SubclassWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (g_mouseLock && IsScaledMouseMsg(m) && !(w & kSelfPosted)) return 0;  // real mouse
   if (IsScaledMouseMsg(m) && (w & kSelfPosted)) {
     w &= ~kSelfPosted;  // game-generated, already in UI coordinates
   } else if (g_active && g_scale != 1.0f && IsScaledMouseMsg(m)) {
@@ -243,8 +292,13 @@ BOOL WINAPI HookPeekMessageW(LPMSG msg, HWND hwnd, UINT fmin, UINT fmax, UINT re
     TracePos("frame", 0, 0);
     HookD3DVtablesOnce();
   }  // change since the last message => not message-driven
+  if (g_mouseLock) EnforceMouseLock();
   BOOL r = g_origPeek(msg, hwnd, fmin, fmax, remove);
   if (g_active) EnforceSmallAssets();
+  if (r && g_mouseLock && IsScaledMouseMsg(msg->message) && !(msg->wParam & kSelfPosted)) {
+    msg->message = WM_NULL;  // real mouse input while the screenshot driver runs
+    return r;
+  }
   if (r && IsScaledMouseMsg(msg->message) && (msg->wParam & kSelfPosted)) {
     // Game-generated: already in UI coordinates. Strip the tag and tell the
     // window procedure not to scale it when it is dispatched.
@@ -328,6 +382,11 @@ bool InstallCore() {
     return false;
   }
   g_active = true;
+  if (!g_cfg.shots.empty()) {
+    g_origGetCursorInfo = reinterpret_cast<GetCursorInfoFn>(
+        PatchIAT(exe, "USER32.dll", "GetCursorInfo", (void*)&HookGetCursorInfo));
+    swscanf(g_cfg.shotMouse.c_str(), L"%f,%f", &g_parkFx, &g_parkFy);
+  }
   Log("Core hooks installed (setting %.2f, 0 = auto)", g_cfg.scale);
   return true;
 }
@@ -350,6 +409,26 @@ void GetRealSize(int* w, int* h) {
 void GetVirtualSize(int* w, int* h) {
   *w = g_virtW;
   *h = g_virtH;
+}
+
+void LockMouseForShots() {
+  if (g_cfg.shots.empty() || !g_active) return;
+  g_mouseLock = true;
+  POINT p;
+  bool ok = ParkPoint(&p);
+  Log("screenshot mouse lock on: parked at %ld,%ld (GetCursorInfo hook %s)", ok ? p.x : -1L,
+      ok ? p.y : -1L, g_origGetCursorInfo ? "ok" : "missing");
+  if (ok) {
+    float s = g_scale > 0 ? g_scale : 1.0f;
+    int vx = (int)floorf(p.x / s), vy = (int)floorf(p.y / s);
+    // tagged as game-generated: already in UI units, passes the lock
+    PostMessageA(g_gameHwnd, WM_MOUSEMOVE, kSelfPosted, MAKELPARAM(vx, vy));
+  }
+}
+
+void UnlockMouseForShots() {
+  if (g_mouseLock) Log("screenshot mouse lock off");
+  g_mouseLock = false;
 }
 
 void SetScaleSetting(float setting, bool apply) {

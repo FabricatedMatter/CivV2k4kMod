@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <shlwapi.h>
 
+#include <iterator>
 #include <unordered_map>
 #include <vector>
 
@@ -290,11 +291,19 @@ void Hook(HMODULE exe, const char* fn, T hook, T* orig) {
 }
 }  // namespace
 
-bool InstallFileRedirect(const std::wstring& gameDir, const std::vector<std::wstring>& roots) {
+bool InstallFileRedirect(const std::wstring& gameDir, const std::vector<std::wstring>& roots,
+                         const std::wstring& onlyUnder,
+                         const std::vector<std::pair<std::wstring, std::wstring>>& generated) {
   InitializeCriticalSection(&g_cs);
   g_gameDirLower = Lower(gameDir);
   if (g_gameDirLower.empty() || g_gameDirLower.back() != L'\\') g_gameDirLower += L'\\';
   for (auto& r : roots) Scan(r, L"");
+  if (!onlyUnder.empty()) {
+    std::wstring pre = Lower(onlyUnder);
+    for (auto it = g_map.begin(); it != g_map.end();)
+      it = it->first.compare(0, pre.size(), pre) == 0 ? std::next(it) : g_map.erase(it);
+  }
+  for (auto& g : generated) g_map[Lower(g.first)] = g.second;
 
   // Files that do not exist in the game folder must be listed virtually.
   for (auto& kv : g_map) {

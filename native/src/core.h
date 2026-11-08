@@ -16,4 +16,9 @@ void GetVirtualSize(int* w, int* h);
 
 // Store a new setting (0 = auto) and re-layout the UI like a resolution change.
 void SetScaleSetting(float setting, bool apply);
+
+// Screenshot automation: ignore the real mouse from now on and park the game's cursor
+// (ShotMouse=<fx>,<fy> of the client area, default 0.98,0.97). Only with Shots=<run>.
+void LockMouseForShots();
+void UnlockMouseForShots();
 }  // namespace uis

@@ -504,6 +504,108 @@ bool PatchSpriteShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, in
   return true;
 }
 
+// ------------------------------------------------- sample-point bias
+// At non-integer UI scales a quad can sit at a half-pixel offset, so pixel centres land
+// exactly on texel boundaries. The UI samples with nearest filtering and interpolation
+// noise then picks the left or right texel at random per pixel: dotted streaks. Every
+// texture coordinate input that a UI shader samples with is moved by 1/32 pixel
+// (screen-space derivatives), which resolves those ties consistently and is otherwise
+// invisible:
+//     deriv_rtx rS.xy, vN.xyxx ; deriv_rty rS.zw, vN.xxxy ; add rS.xy, rS.xyxx, rS.zwzz
+//     mad rB.xy, rS.xyxx, l(1/32), vN.xyxx ; mov rB.zw, vN.zwzw
+// (then every vN read becomes rB). The mov matters: vN.zw often carries unrelated data
+// (the two-texture crossfade shader keeps its blend weights there), so rB must be an
+// exact copy of vN apart from the biased xy, and the derivatives need their own temp rS.
+constexpr uint32_t kOpDerivX = 11, kOpDerivY = 12, kOpMov = 54, kOpSample = 69,
+                   kOpSampleB = 74, kOpDclInputPs = 98;
+
+bool BiasSampleCoords(const void* bc, SIZE_T len, std::vector<uint8_t>& out) {
+  auto b = static_cast<const uint8_t*>(bc);
+  uint32_t so = 0, ssize = 0, nch = 0;
+  if (!FindShex(b, len, &so, &ssize, &nch)) return false;
+  const uint32_t* toks = reinterpret_cast<const uint32_t*>(b + so + 8);
+  const uint32_t* end = toks + ssize / 4;
+  std::vector<const uint32_t*> ins;
+  int tempsAt = -1, firstCode = -1;
+  uint32_t coord = 0xFFFFFFFF;
+  for (const uint32_t* p = toks + 2; p < end;) {
+    uint32_t l = InstrLen(p), op = p[0] & 0x7FF;
+    if (!l || p + l > end) return false;
+    if (op == kOpDclTemps && l == 2) tempsAt = (int)ins.size();
+    bool decl = op >= 88 && op <= 106;
+    if (!decl && op != kOpCustomData && firstCode < 0) firstCode = (int)ins.size();
+    if (op == kOpSample || op == kOpSampleL || op == kOpSampleB) {
+      // coordinate = second operand; only a plain input register qualifies
+      const uint32_t* q = p + 1;
+      if (p[0] & 0x80000000u) {
+        while (q < p + l && (*q & 0x80000000u)) ++q;
+        ++q;
+      }
+      uint32_t ol, ty, idx;
+      if (ParseOperand(q, p + l, &ol, &ty, &idx) &&
+          ParseOperand(q + ol, p + l, &ol, &ty, &idx) && ty == 1) {
+        if (coord != 0xFFFFFFFF && coord != idx) return false;  // several: leave alone
+        coord = idx;
+      }
+    }
+    ins.push_back(p);
+    p += l;
+  }
+  if (coord == 0xFFFFFFFF || tempsAt < 0 || firstCode < 0) return false;
+  // components of vN beyond xy that the shader declares (dcl_input_ps / _sgv / _siv)
+  uint32_t zwMask = 0;
+  for (const uint32_t* p : ins) {
+    uint32_t op = p[0] & 0x7FF;
+    if (op < kOpDclInputPs || op > kOpDclInputPsSiv || InstrLen(p) < 3) continue;
+    if (((p[1] >> 12) & 0xFF) == 1 && p[2] == coord) zwMask |= (p[1] >> 4) & 0xC;
+  }
+  uint32_t rB = ins[tempsAt][1], rS = rB + 1;
+  const uint32_t d = 0x3D000000u;  // 1/32
+  std::vector<uint32_t> o(toks, toks + 2);
+  for (size_t k = 0; k < ins.size(); ++k) {
+    const uint32_t* p = ins[k];
+    uint32_t l = InstrLen(p), op = p[0] & 0x7FF;
+    if ((int)k == tempsAt) {
+      o.insert(o.end(), {p[0], rB + 2});
+      continue;
+    }
+    if ((int)k == firstCode) {
+      o.insert(o.end(), {kOpDerivX | (5u << 24), 0x00100032u, rS, 0x00101046u, coord});
+      o.insert(o.end(), {kOpDerivY | (5u << 24), 0x001000C2u, rS, 0x00101406u, coord});
+      o.insert(o.end(), {kOpAdd | (7u << 24), 0x00100032u, rS, 0x00100046u, rS, 0x00100AE6u, rS});
+      o.insert(o.end(), {kOpMad | (12u << 24), 0x00100032u, rB, 0x00100046u, rS, 0x00004002u, d, d,
+                         d, d, 0x00101046u, coord});
+      if (zwMask)  // mov rB.(zw & declared), vN.zwzw
+        o.insert(o.end(), {kOpMov | (5u << 24), 0x00100002u | (zwMask << 4), rB, 0x00101EE6u, coord});
+    }
+    size_t at = o.size();
+    o.insert(o.end(), p, p + l);
+    if ((op >= 88 && op <= 106) || op == kOpCustomData) continue;
+    // rewrite reads of vN to rB (operand type input -> temp)
+    uint32_t* q = o.data() + at + 1;
+    uint32_t* e = o.data() + at + l;
+    if (o[at] & 0x80000000u) {
+      while (q < e && (*q & 0x80000000u)) ++q;
+      ++q;
+    }
+    for (int n = 0; q < e; ++n) {
+      uint32_t ol, ty, idx;
+      if (!ParseOperand(q, e, &ol, &ty, &idx)) {
+        if (n == 0) break;  // no operands (ret, else, ...)
+        return false;
+      }
+      if (ty == 1 && idx == coord) {
+        if (((q[0] >> 20) & 3) != 1) return false;
+        q[0] &= ~(0xFFu << 12);  // temp
+        q[1] = rB;
+      }
+      q += ol;
+    }
+  }
+  RebuildDxbc(b, len, so, ssize, nch, o, out);
+  return true;
+}
+
 // ---------------------------------------------------------------- hooks
 using CreatePSFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T,
                                                 ID3D11ClassLinkage*, ID3D11PixelShader**);
@@ -726,7 +828,7 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
       D3D11_SUBRESOURCE_DATA one = {&zero, 4, 0};
       HRESULT hr = g_origCreateTex2D(dev, &sd, &one, out);
       if (SUCCEEDED(hr)) {
-        if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0)
+        if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0 || g_cfg.dumpTextures)
           Log("UI art replaced #%d: %ux%u index map -> 1x1 stand-in", g_artReplaced, d->Width,
               d->Height);
         return hr;
@@ -735,7 +837,7 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
       return g_origCreateTex2D(dev, d, init, out);
     }
     if (it == g_art.end()) {
-      if (g_artMisses++ < 40) {
+      if (g_artMisses++ < 40 || g_cfg.dumpTextures) {
         auto p = static_cast<const uint8_t*>(init->pSysMem);
         Log("UI art candidate %ux%u fmt %d hash %016llx: no match (px0 %02x%02x%02x%02x)",
             d->Width, d->Height, (int)d->Format, (unsigned long long)h, p[0], p[1], p[2], p[3]);
@@ -783,7 +885,7 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
           if (SUCCEEDED(hr)) {
             const std::wstring& fn = it->second.file;
             g_artTex[*out] = fn.substr(fn.rfind(L'\\') + 1);
-            if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0) {
+            if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0 || g_cfg.dumpTextures) {
               const std::wstring& f = it->second.file;
               Log("UI art replaced #%d: %ux%u -> %ux%u %ls", g_artReplaced, d->Width, d->Height,
                   fw, fh, f.c_str() + (f.rfind(L'\\') + 1));
@@ -842,6 +944,8 @@ HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device*, const void*, SIZE_T,
 std::unordered_map<void*, std::vector<uint8_t>> g_psCode;  // diagnostics: PS -> bytecode
 void* g_curPS[2] = {};
 std::unordered_set<void*> g_psDumped;
+std::unordered_set<void*> g_spritePS;  // pixel shaders with the tile-sprite patch
+
 void DumpPSCode(void* ps, const wchar_t* tag) {
   EnterCriticalSection(&g_cs);
   auto pc = g_psCode.find(ps);
@@ -887,31 +991,52 @@ HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device* dev, const void* bc, S
   // 2) UI clip rects
   std::vector<uint8_t> patched;
   int changed = 0;
-  if (IsActive() && bc && PatchClipShader(bc, len, patched, &changed)) {
-    HRESULT hr = g_origCreatePS(dev, patched.data(), patched.size(), link, out);
-    if (SUCCEEDED(hr) && out && *out) {
-      EnterCriticalSection(&g_cs);
-      g_patched.insert(*out);
-      int n = ++g_patchedCount;
-      LeaveCriticalSection(&g_cs);
-      if (n <= 3 || n % 10 == 0)
-        Log("patched UI clip pixel shader #%d (%d clip instructions)", n, changed);
-      if (nSprite) Log("patched tile sprite shader (%d fetches)", nSprite);
-      return hr;
-    }
+  bool clip = IsActive() && bc && PatchClipShader(bc, len, patched, &changed);
+  if (clip) {
+    bc = patched.data();
+    len = patched.size();
+  }
+  // 3) UI shaders: move sample points off exact texel boundaries
+  const void* preBc = bc;
+  SIZE_T preLen = len;
+  std::vector<uint8_t> biased;
+  bool bias = (clip || nSprite) && IsActive() && !g_cfg.vanilla && g_cfg.sampleBias &&
+              BiasSampleCoords(bc, len, biased);
+  if (bias) {
+    bc = biased.data();
+    len = biased.size();
+  }
+  HRESULT hr = g_origCreatePS(dev, bc, len, link, out);
+  if (FAILED(hr) && bias) {
+    Log("biased UI shader rejected (0x%08lx), using it without the bias", (unsigned long)hr);
+    bias = false;
+    hr = g_origCreatePS(dev, preBc, preLen, link, out);
+  }
+  if (FAILED(hr) && (clip || nSprite)) {
     Log("patched shader rejected (0x%08lx), using original", (unsigned long)hr);
     return g_origCreatePS(dev, origBc, origLen, link, out);
   }
-  if (nSprite) {
-    HRESULT hr = g_origCreatePS(dev, bc, len, link, out);
-    if (SUCCEEDED(hr)) {
-      Log("patched tile sprite shader (%d fetches)", nSprite);
-      return hr;
-    }
-    Log("patched sprite shader rejected (0x%08lx), using original", (unsigned long)hr);
-    return g_origCreatePS(dev, origBc, origLen, link, out);
+  if (SUCCEEDED(hr) && clip && out && *out) {
+    EnterCriticalSection(&g_cs);
+    g_patched.insert(*out);
+    int n = ++g_patchedCount;
+    LeaveCriticalSection(&g_cs);
+    if (n <= 3 || n % 10 == 0)
+      Log("patched UI clip pixel shader #%d (%d clip instructions)", n, changed);
   }
-  return g_origCreatePS(dev, bc, len, link, out);
+  if (SUCCEEDED(hr) && nSprite) {
+    Log("patched tile sprite shader (%d fetches) ps %p", nSprite, out ? (void*)*out : nullptr);
+    if (out && *out) {
+      EnterCriticalSection(&g_cs);
+      g_spritePS.insert(*out);
+      LeaveCriticalSection(&g_cs);
+    }
+  }
+  if (SUCCEEDED(hr) && bias) {
+    static int nb = 0;
+    if (++nb <= 6) Log("biased UI shader sample coordinates (zw preserved)");
+  }
+  return hr;
 }
 
 template <int W>
@@ -959,15 +1084,39 @@ DrawFn g_origDraw[2] = {};
 
 void DumpPSCode(void* ps, const wchar_t* tag);
 
+bool ArtTraced(const std::wstring& name) {
+  if (g_cfg.artTrace.empty()) return false;
+  size_t s = 0;
+  while (s <= g_cfg.artTrace.size()) {
+    size_t e = g_cfg.artTrace.find(L',', s);
+    if (e == std::wstring::npos) e = g_cfg.artTrace.size();
+    std::wstring part = g_cfg.artTrace.substr(s, e - s);
+    if (!part.empty() && name.find(part) != std::wstring::npos) return true;
+    s = e + 1;
+  }
+  return false;
+}
+
+UINT g_ovlRTSize[2] = {};  // overlay diagnostics: size of the bound overlay page (0 = none)
+std::unordered_set<void*> g_ovlPSLogged;
 template <int S>
 void NoteDraw() {
+  if (g_ovlRTSize[S] && g_ovlPSLogged.size() < 60 && g_ovlPSLogged.insert(g_curPS[S]).second) {
+    Log("ovl draw ctx%d into %ux%u page: ps %p", S, g_ovlRTSize[S], g_ovlRTSize[S], g_curPS[S]);
+    DumpPSCode(g_curPS[S], g_ovlRTSize[S] == 256 ? L"ovl256" : L"ovlbig");
+  }
   for (int i = 0; i < 8; ++i) {
     const std::wstring* a = g_boundArt[S][i];
-    if (!a || g_drawLogged.size() > 300) continue;
+    if (!a) continue;
+    bool traced = ArtTraced(*a);
+    if (!traced && g_drawLogged.size() > 300) continue;
     wchar_t key[300];
     swprintf(key, 300, L"%ls@%p", a->c_str(), g_curPS[S]);
     if (!g_drawLogged.insert(key).second) continue;
-    Log("draw ctx%d slot %d %ls ps %p", S, i, a->c_str(), g_curPS[S]);
+    Log("draw ctx%d slot %d %ls ps %p%s", S, i, a->c_str(), g_curPS[S],
+        traced ? (g_spritePS.count(g_curPS[S]) ? " [traced, sprite-patched ps]"
+                                               : " [traced, ps NOT sprite-patched]")
+               : "");
     DumpPSCode(g_curPS[S], L"draw");
   }
 }
@@ -998,7 +1147,7 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* c, UINT start, UINT n,
     }
     g_boundArt[S][start + i] = a;
   }
-  if (v && !g_artTex.empty() && g_artBoundLogged.size() < 150) {
+  if (v && !g_artTex.empty()) {
     for (UINT i = 0; i < n; ++i) {
       if (!v[i]) continue;
       ID3D11Resource* r = nullptr;
@@ -1006,7 +1155,12 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* c, UINT start, UINT n,
       if (!r) continue;
       auto it = g_artTex.find(r);
       r->Release();
-      if (it == g_artTex.end() || !g_artBoundLogged.insert(it->second).second) continue;
+      if (it == g_artTex.end()) continue;
+      bool traced = ArtTraced(it->second);
+      if (!traced && g_artBoundLogged.size() >= 150) continue;
+      wchar_t bkey[300];
+      swprintf(bkey, 300, L"%ls@%p", it->second.c_str(), g_curPS[S]);
+      if (!g_artBoundLogged.insert(traced ? bkey : it->second).second) continue;
       ID3D11RenderTargetView* rtv = nullptr;
       c->OMGetRenderTargets(1, &rtv, nullptr);
       D3D11_TEXTURE2D_DESC td = {};
@@ -1026,9 +1180,11 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* c, UINT start, UINT n,
       UINT nvp = 1;
       c->RSGetViewports(&nvp, &vp);
       Log("art bound ctx%d slot %u %ls -> RT %ux%u fmt %d bind 0x%x misc 0x%x mips %u, vp %.0fx%.0f "
-          "ps %p",
+          "ps %p%s",
           S, start + i, it->second.c_str(), td.Width, td.Height, (int)td.Format, td.BindFlags,
-          td.MiscFlags, td.MipLevels, vp.Width, vp.Height, g_curPS[S]);
+          td.MiscFlags, td.MipLevels, vp.Width, vp.Height, g_curPS[S],
+          !traced ? "" : g_spritePS.count(g_curPS[S]) ? " [traced: sprite-patched ps]"
+                                                     : " [traced: ps NOT sprite-patched]");
       EnterCriticalSection(&g_cs);
       auto pc = g_psCode.find(g_curPS[S]);
       if (pc != g_psCode.end() && g_psDumped.insert(g_curPS[S]).second) {
@@ -1245,6 +1401,14 @@ template <int S>
 void STDMETHODCALLTYPE DiagOMSetRT(ID3D11DeviceContext* c, UINT n,
                                    ID3D11RenderTargetView* const* rtv,
                                    ID3D11DepthStencilView* dsv) {
+  g_ovlRTSize[S] = 0;
+  if (n && rtv && rtv[0]) {
+    ID3D11Resource* r = nullptr;
+    rtv[0]->GetResource(&r);
+    D3D11_TEXTURE2D_DESC od;
+    if (r && DescOf(r, &od) && IsOverlayRT(&od)) g_ovlRTSize[S] = od.Width;
+    if (r) r->Release();
+  }
   if (g_ovDiag < 400 && n && rtv && rtv[0]) {
     ID3D11Resource* r = nullptr;
     rtv[0]->GetResource(&r);

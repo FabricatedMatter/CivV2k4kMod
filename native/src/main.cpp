@@ -8,6 +8,7 @@
 #include "core.h"
 #include "log.h"
 #include "lua_bridge.h"
+#include "optionspatch.h"
 #include "redirect.h"
 
 namespace uis {
@@ -60,7 +61,13 @@ static void Init() {
       roots.push_back(g_modDir + L"\\Fonts\\" + k);
       Log("crisp fonts: using %ls atlases for scale %.2f", k, s);
     }
-    InstallFileRedirect(gameDir, roots);
+    // UI Scale controls in whichever options menu the game loads (base, EUI, ...); also
+    // in vanilla mode, where the screenshot driver is started from the options menu
+    auto menus = PatchOptionsMenus(gameDir, g_userDir + L"\\UIScale\\cache", g_cfg.patchOptionsMenu);
+    // Vanilla (screenshot "before" runs): only the options menu + shot driver, not the
+    // smoothed culture borders
+    InstallFileRedirect(gameDir, roots, g_cfg.vanilla ? L"Assets\\UI\\" : L"", menus);
+    if (g_cfg.vanilla) Log("Vanilla=1: rendering like the unmodded game (screenshot mode)");
   }
   if (core) InstallD3DHooks();
   if (core && g_cfg.strategicViewFix) InstallStrategicFix(GetCurrentThreadId());  // DllMain runs on the main thread

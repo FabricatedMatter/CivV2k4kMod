@@ -9,6 +9,10 @@ Makes the Civilization V interface crisp and readable at 1440p, 4K and above.
 Works on Windows and on Linux (Steam + Proton) with the Steam DX11 version of the game, and with
 any combination of DLC. The native Linux port of Civ V (OpenGL) is not supported.
 
+Works with Enhanced UI (EUI) and Vox Populi's EUI in any install order: the UI Scale slider is
+added to whichever options menu the game loads (`PatchOptionsMenu=0` in `UIScale.ini` limits
+this to the base game's menu).
+
 ## Install
 
 **Windows:** download `CivVUIScale-Setup.exe` from the latest release and run it.
@@ -49,7 +53,9 @@ A `version.dll` proxy hooks the game without modifying any game code or files:
 - the UI is laid out at a virtual resolution (real / scale) and drawn at the real one
 - mouse input is scaled to match
 - UI clip shaders are patched so scroll panels and text boxes keep working
-- hi-res font atlases and the modified options menu are served via a virtual file overlay
+- hi-res font atlases are served via a virtual file overlay; the options menus found under
+  `Assets\` (base game, EUI's copy in `Assets\DLC\UI_bc1`) are patched at every launch into
+  `My Games\...\UIScale\cache` and served the same way
 - hi-res UI textures replace the originals on upload, matched by content hash; the tile-sprite
   shader is patched so larger sprite atlases are sampled at full resolution
 - strategic-view icons are realigned via a hardware breakpoint

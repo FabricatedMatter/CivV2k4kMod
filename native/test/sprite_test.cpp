@@ -25,7 +25,13 @@ int main(int argc, char** argv) {
         FILE* o2 = fopen((std::string(argv[i + 1]) + ".clip").c_str(), "wb");
         fwrite(both.data(), 1, both.size(), o2); fclose(o2);
       }
-      printf("%s: %d sprite fetches patched, %d clip\n", argv[i], changed, clip);
+      std::vector<uint8_t> bias;
+      if (uis::BiasSampleCoords(out.data(), out.size(), bias)) {
+        FILE* o3 = fopen((std::string(argv[i + 1]) + ".bias").c_str(), "wb");
+        fwrite(bias.data(), 1, bias.size(), o3); fclose(o3);
+      }
+      printf("%s: %d sprite fetches patched, %d clip, bias %d\n", argv[i], changed, clip,
+             (int)!bias.empty());
     }
   }
 }

@@ -609,7 +609,8 @@ def main():
     if a.list:
         for it, m in zip(items, methods):
             print("%-44s %4dx%-4d %-7s %s" % (it["name"], it["src"].shape[1], it["src"].shape[0], m,
-                                             "sprite t=%d" % it["t"] if it["index"] is not None else ""))
+                                             ("sprite t=%d%s" % (it["t"], " direct" if it.get("direct") else ""))
+                                             if it["index"] is not None else ""))
         return
     os.makedirs(os.path.join(a.out, "report"), exist_ok=True)
     report, fits, rows = [], {}, []
