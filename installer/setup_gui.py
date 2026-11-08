@@ -183,7 +183,7 @@ class Setup:
         self.text(W / 2, 27, TITLE.upper(), self.f_title, GOLD, anchor="center")
         self.text(W - 66, 28, "v" + core.VERSION, self.f_small, MUTED, anchor="e")
         if SHAPED:
-            self.close_btn = Sprite(self, skin.get(self.art, "close"), 64, 4,
+            self.close_btn = Sprite(self, haloed(skin.get(self.art, "close")), 64, 4,
                                     W - 52, 16, 22, 22, self.root.destroy)
         c.bind("<ButtonPress-1>", self.drag_start)
         c.bind("<B1-Motion>", self.drag_move)
@@ -755,6 +755,16 @@ class Link:
 
     def destroy(self):
         self.c.delete(self.tag)
+
+
+def haloed(img):
+    """Light rim around dark art (the close X) so it reads on the frame's dark band."""
+    from PIL import ImageFilter
+    a = img.getchannel("A").filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(1))
+    rim = Image.new("RGBA", img.size, (236, 222, 196, 0))
+    rim.putalpha(a.point(lambda v: v * 200 // 255))
+    rim.alpha_composite(img)
+    return rim
 
 
 # ---------------------------------------------------------------- icon
