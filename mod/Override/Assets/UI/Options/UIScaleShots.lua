@@ -164,11 +164,12 @@ elseif g_ctx == "OptionsMenu_InGame" then
 				Wait(1.5);
 			end
 
-			if not g_vanilla and OnCategory then
-				-- this context is the options menu: show its Interface tab (UI Scale slider)
+			if not g_vanilla then
+				-- this context is the options menu: show its Interface tab (UI Scale slider);
+				-- EUI keeps OnCategory local but opens on that tab in game anyway
 				UIManager:QueuePopup(ContextPtr, PopupPriority.OptionsMenu);
 				Wait(1);
-				OnCategory(2);
+				if OnCategory then OnCategory(2); end
 				Wait(1.5);
 				Shot(pass.tag .. "_options");
 				UIScale.PostKey(VK_ESCAPE);

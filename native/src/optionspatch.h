@@ -12,7 +12,7 @@ namespace uis {
 // Returns game-relative path -> patched copy, for InstallFileRedirect.
 std::vector<std::pair<std::wstring, std::wstring>> PatchOptionsMenus(const std::wstring& gameDir,
                                                                      const std::wstring& cacheDir,
-                                                                     bool thirdParty);
+                                                                     bool thirdParty, bool shots);
 
 // Text patchers (pure; also used by test/optpatch_test.cpp).
 // XML: inserts the (hidden) UIScaleBlock after the PinchSpeedSlider element and names its

@@ -80,20 +80,9 @@ if UIScaleAvailable() then
 
 	Controls.UIScaleApplyButton:RegisterCallback(Mouse.eLClick, UIScaleCommit);
 
-	-- Accept: wrap the global OnOK (base game and EUI both register it on AcceptButton;
-	-- each control keeps a single callback, so register the wrapper again).
-	if type(OnOK) == "function" then
-		local BaseOnOK = OnOK;
-		OnOK = function(...)
-			BaseOnOK(...);
-			UIScaleCommit();
-		end
-		if Controls.AcceptButton ~= nil then
-			Controls.AcceptButton:RegisterCallback(Mouse.eLClick, OnOK);
-		end
-	else
-		print("[UIScale] OptionsMenu: no global OnOK, the scale is applied with Apply only");
-	end
+	-- Accept: the patch's prologue calls this from OptionsManager.CommitGraphicsOptions, which
+	-- only the Accept handler calls (base game and EUI alike).
+	UIScaleOnAccept = UIScaleCommit;
 
 	-- Reopening the menu (e.g. after Cancel) shows the saved setting again.
 	UIScaleOnShowHide = function(bIsHide, bIsInit)

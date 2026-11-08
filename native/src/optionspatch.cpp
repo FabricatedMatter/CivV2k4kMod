@@ -63,9 +63,16 @@ const struct {
 
 // Defined before the file's own code, on its first line (keeps Lua line numbers intact).
 // A global, not a local: big menus come close to Lua 5.1's 200-locals limit.
+// Runs before the menu's own code. Besides the show/hide hook it shadows OptionsManager in
+// this context's globals: CommitGraphicsOptions is called exactly once, by Accept, in both the
+// base menu (global OnOK) and EUI (an anonymous local handler that cannot be wrapped), and
+// EUI keeps OptionsManager in a local, so it has to be in place before that line runs.
 const char* const kLuaPrologue =
     "UIScale_SetShowHide = function(ctx, f) ctx:SetShowHideHandler(function(h, i) "
-    "if f then f(h, i) end if UIScaleOnShowHide then UIScaleOnShowHide(h, i) end end) end; ";
+    "if f then f(h, i) end if UIScaleOnShowHide then UIScaleOnShowHide(h, i) end end) end; "
+    "if OptionsManager ~= nil then local om = OptionsManager; OptionsManager = setmetatable({ "
+    "CommitGraphicsOptions = function(...) local r = om.CommitGraphicsOptions(...); "
+    "if UIScaleOnAccept then pcall(UIScaleOnAccept) end return r end }, { __index = om }) end; ";
 
 bool IsWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 bool IsIdent(char c) { return isalnum((unsigned char)c) || c == '_'; }
@@ -280,6 +287,20 @@ bool PatchOptionsLua(const std::string& s, const std::string& parentId, std::str
   return true;
 }
 
+// Screenshot mode: EUI's MainMenu.xml loads OptionsMenu_FrontEnd only when it is opened
+// (DeferLoad="1"); the shot driver starts from the options menu, so load it right away.
+bool UndeferFrontEndOptions(const std::string& s, std::string& out) {
+  size_t id = s.find("ID=\"OptionsMenu_FrontEnd\"");
+  if (id == std::string::npos) return false;
+  size_t a = s.rfind('<', id), b = s.find('>', id);
+  if (a == std::string::npos || b == std::string::npos) return false;
+  const std::string attr = "DeferLoad=\"1\"";
+  size_t d = s.find(attr, a);
+  if (d == std::string::npos || d > b) return false;
+  out = s.substr(0, d) + s.substr(d + attr.size());
+  return true;
+}
+
 #ifdef _WIN32
 namespace {
 bool ReadAll(const std::wstring& path, std::string& data) {
@@ -334,11 +355,40 @@ void FindMenus(const std::wstring& dir, const std::wstring& rel, std::vector<Fou
 }
 }  // namespace
 
+void FindMainMenus(const std::wstring& dir, const std::wstring& rel,
+                   std::vector<std::wstring>& out) {
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    std::wstring name = fd.cFileName;
+    if (name == L"." || name == L"..") continue;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      FindMainMenus(dir + L"\\" + name, rel + L"\\" + name, out);
+    else if (_wcsicmp(name.c_str(), L"MainMenu.xml") == 0)
+      out.push_back(rel + L"\\" + name);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
 std::vector<std::pair<std::wstring, std::wstring>> PatchOptionsMenus(const std::wstring& gameDir,
                                                                      const std::wstring& cacheDir,
-                                                                     bool thirdParty) {
+                                                                     bool thirdParty, bool shots) {
   std::vector<std::pair<std::wstring, std::wstring>> result;
   DWORD t0 = GetTickCount();
+  if (shots) {
+    std::vector<std::wstring> mains;
+    FindMainMenus(gameDir + L"\\Assets", L"Assets", mains);
+    for (auto& rel : mains) {
+      std::string s, out;
+      if (ReadAll(gameDir + L"\\" + rel, s) && UndeferFrontEndOptions(s, out) &&
+          WriteIfChanged(cacheDir + L"\\" + rel, out)) {
+        result.push_back({rel, cacheDir + L"\\" + rel});
+        Log("screenshot mode: front-end options menu loaded at start (%ls)", rel.c_str());
+      }
+    }
+  }
+  size_t extra = result.size();
   std::vector<Found> menus;
   FindMenus(gameDir + L"\\Assets", L"Assets", menus);
   for (auto& m : menus) {
@@ -380,7 +430,7 @@ std::vector<std::pair<std::wstring, std::wstring>> PatchOptionsMenus(const std::
     if (hooks == 0) Log("  no SetShowHideHandler found: the slider is only refreshed on load");
   }
   Log("options menus: %u found, %u patched (%lu ms)", (unsigned)menus.size(),
-      (unsigned)result.size() / 2, GetTickCount() - t0);
+      (unsigned)(result.size() - extra) / 2, GetTickCount() - t0);
   return result;
 }
 #endif

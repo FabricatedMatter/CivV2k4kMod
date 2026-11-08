@@ -63,7 +63,8 @@ static void Init() {
     }
     // UI Scale controls in whichever options menu the game loads (base, EUI, ...); also
     // in vanilla mode, where the screenshot driver is started from the options menu
-    auto menus = PatchOptionsMenus(gameDir, g_userDir + L"\\UIScale\\cache", g_cfg.patchOptionsMenu);
+    auto menus = PatchOptionsMenus(gameDir, g_userDir + L"\\UIScale\\cache", g_cfg.patchOptionsMenu,
+                               !g_cfg.shots.empty());
     // Vanilla (screenshot "before" runs): only the options menu + shot driver, not the
     // smoothed culture borders
     InstallFileRedirect(gameDir, roots, g_cfg.vanilla ? L"Assets\\UI\\" : L"", menus);
