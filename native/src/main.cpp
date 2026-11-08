@@ -10,6 +10,7 @@
 #include "lua_bridge.h"
 #include "optionspatch.h"
 #include "redirect.h"
+#include "version.h"
 
 namespace uis {
 bool LoadRealVersionDll();
@@ -44,7 +45,7 @@ static void Init() {
   g_modDir = gameDir + L"\\UIScale";
   CreateDirectoryW((g_userDir + L"\\Logs").c_str(), nullptr);
   LogInit(g_userDir + L"\\Logs\\UIScale.log");
-  Log("Civ V UI Scale v1 loaded into %ls", exeName.c_str());
+  Log("Civ V UI Scale " UISCALE_VER_STR " loaded into %ls", exeName.c_str());
 
   InstallCrashLogger();
   LoadConfig();

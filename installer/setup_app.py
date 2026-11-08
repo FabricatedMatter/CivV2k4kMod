@@ -13,7 +13,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import setup_core as core  # noqa: E402
 
-TITLE = "Civ V UI Scale Setup"
+TITLE = "Civ V UI Scale %s Setup" % core.VERSION
 
 
 # ------------------------------------------------------------------ text mode
@@ -80,8 +80,6 @@ def gui():
         lab = ttk.Label(parent, justify="left", **kw)
         lab.bind("<Configure>", lambda e: lab.config(wraplength=max(200, e.width - 4)))
         return lab
-    wrapping(root, text="Makes the Civilization V interface crisp and readable at 1440p, 4K "
-                        "and above.").pack(anchor="w", fill="x", **pad)
 
     # game folder
     f = ttk.LabelFrame(root, text="Game folder")
@@ -179,7 +177,7 @@ def gui():
                     root.after(0, lambda: messagebox.showinfo(TITLE, "\n\n".join(notes)))
             except Exception as e:
                 log("Error: %s" % e)
-                root.after(0, lambda: messagebox.showerror(TITLE, str(e)))
+                root.after(0, lambda m=str(e): messagebox.showerror(TITLE, m))
             finally:
                 root.after(0, lambda: [b.state(["!disabled"]) for b in btns.winfo_children()])
                 root.after(0, check_game)
@@ -211,7 +209,14 @@ def main():
     ap.add_argument("--no-font", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--yes", action="store_true", help="no questions (with --cli)")
+    # used when the window restarts itself as administrator (Windows)
+    ap.add_argument("--install", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--uninstall-gui", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--write-icon", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.write_icon:  # build step: the exe icon
+        import setup_gui
+        return setup_gui.write_icon(a.write_icon)
     if a.cli or a.uninstall or (sys.platform != "win32" and not os.environ.get("DISPLAY")
                                 and not os.environ.get("WAYLAND_DISPLAY")):
         try:
@@ -220,11 +225,11 @@ def main():
             sys.exit("Error: %s" % e)
     try:
         try:
-            import setup_gui  # modern window (CustomTkinter)
+            import setup_gui  # Civ V styled window (tkinter + Pillow)
         except ImportError:
             setup_gui = None
         if setup_gui:
-            setup_gui.run()
+            setup_gui.run(a)
         else:
             gui()
     except Exception as e:  # no Tk available: fall back to text mode

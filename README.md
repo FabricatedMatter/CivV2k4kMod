@@ -15,7 +15,13 @@ this to the base game's menu).
 
 ## Install
 
-**Windows:** download `CivVUIScale-Setup.exe` from the latest release and run it.
+**Windows:** download `CivVUIScale-Setup.exe` from the latest release and run it. It fetches
+the art pack (`civ5-uiscale-art-x2.pack`) itself, or uses one placed next to it.
+
+Windows Security may flag the mod's `version.dll`. That is a false alarm: the mod loads into
+the game through a proxy DLL, the same way some malware does, and the DLL is not code-signed.
+If the installer reports that it was blocked, open *Windows Security → Virus & threat protection
+→ Protection history*, choose *Allow on device* for `version.dll`, and click Install again.
 
 **Linux:** download `civ5-uiscale-setup-linux.tar.gz`, unpack it and run `./install.sh`.
 Then set the Steam launch options of Civilization V to
@@ -106,5 +112,10 @@ git tag vX.Y && git push --tags      # CI builds the DLL and both setup programs
 gh release upload vX.Y build/packs/*.pack
 ```
 
-The installer (`installer/`) is a CustomTkinter app bundled with PyInstaller by
-`.github/workflows/release.yml`; `installer/setup_app.py --cli` runs it in text mode.
+The installer (`installer/`) is a tkinter + Pillow app bundled with PyInstaller by
+`.github/workflows/release.yml`; `installer/setup_app.py --cli` runs it in text mode. Its window
+is drawn with the game's own main-menu frame, buttons and meter, read from the player's game
+files at start (`installer/skin.py`; hi-res from the installed mod or the art pack). Without the
+game it falls back to drawn stand-ins. The DLL is bundled zlib-compressed
+(`payload/version.bin`), so no raw DLL is ever unpacked to `%TEMP%`. Bump the version in
+`native/src/version.h`, `installer/setup_core.py` and `installer/exe_version.txt` together.

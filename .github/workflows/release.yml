@@ -27,32 +27,41 @@ jobs:
         include:
           - os: windows-latest
             name: CivVUIScale-Setup
-            windowed: --windowed
+            extra: --windowed --icon build/icon.ico --version-file installer/exe_version.txt
           - os: ubuntu-22.04   # older glibc: runs on more distros
             name: civ5-uiscale-setup
-            windowed: ""
+            extra: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: version-dll
-          path: payload
+          path: dll
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller numpy pillow customtkinter
+      - run: pip install pyinstaller numpy pillow
+      # the DLL goes in compressed: a raw DLL unpacked to %TEMP% by the exe gets blocked by
+      # Windows Security as a dropped payload
+      - name: Payload and icon
+        shell: bash
+        run: |
+          mkdir -p payload build
+          python -c "import sys; sys.path.insert(0, 'installer'); import setup_core as c; c.make_payload('dll/version.dll', 'payload/version.bin')"
+          python installer/setup_app.py --write-icon build/icon.ico
       - name: Build setup program
         shell: bash
         run: >
-          pyinstaller --onefile ${{ matrix.windowed }} --name ${{ matrix.name }}
+          pyinstaller --onefile ${{ matrix.extra }} --name ${{ matrix.name }}
           --paths tools --paths installer
-          --add-data "payload/version.dll:payload"
+          --add-data "payload/version.bin:payload"
           --add-data "mod:payload/mod"
           --add-data "tools:tools"
           --hidden-import numpy --hidden-import PIL.Image --hidden-import PIL.ImageFont
-          --hidden-import PIL.ImageDraw --hidden-import PIL.ImageFilter
-          --hidden-import setup_gui --collect-data customtkinter
+          --hidden-import PIL.ImageDraw --hidden-import PIL.ImageFilter --hidden-import PIL.ImageTk
+          --hidden-import setup_gui --hidden-import skin --hidden-import bcn
+          --hidden-import uisprite --hidden-import pack --hidden-import locate
           installer/setup_app.py
       - name: Package
         shell: bash

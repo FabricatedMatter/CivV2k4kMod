@@ -28,12 +28,29 @@ PACK_NAME = "civ5-uiscale-art-x%d.pack"
 
 
 # ------------------------------------------------------------------ payload
+VERSION = "0.1.0"
+DLL_BLOB = "version.bin"   # the DLL zlib-compressed: no raw DLL is ever unpacked to %TEMP%
+
+
 def payload_dll():
-    for p in (os.path.join(BUNDLE, "payload", "version.dll"),
-              os.path.join(BUNDLE, "native", "build", "version.dll")):
-        if os.path.isfile(p):
-            return p
+    """Bytes of the mod's version.dll."""
+    import zlib
+    p = os.path.join(BUNDLE, "payload", DLL_BLOB)
+    if os.path.isfile(p):
+        with open(p, "rb") as f:
+            return zlib.decompress(f.read())
+    p = os.path.join(BUNDLE, "native", "build", "version.dll")
+    if os.path.isfile(p):
+        with open(p, "rb") as f:
+            return f.read()
     raise FileNotFoundError("version.dll is missing from the installer")
+
+
+def make_payload(dll, out):
+    """Build step: writes the compressed DLL the installer bundles."""
+    import zlib
+    with open(dll, "rb") as f, open(out, "wb") as o:
+        o.write(zlib.compress(f.read(), 9))
 
 
 def payload_mod():
@@ -114,15 +131,92 @@ def find_font():
     return None
 
 
-FONT_HINT = ("Tw Cen MT is not installed. The mod works without it (crisp reconstructed glyphs "
-             "are included), but the real font looks even better. It is easy to find: search the "
-             "web for \"Tw Cen MT font download\", install the .ttf like any font (double-click "
-             "it, then Install), and click Check again.")
+FONT_HINT = ("Not installed. Optional: the mod ships its own glyphs. For the real font, "
+             "install Tw Cen MT (.ttf) and check again.")
 
 
 # ------------------------------------------------------------------ install
 class Cancelled(Exception):
     pass
+
+
+class NeedsAdmin(Exception):
+    """The game folder is write-protected; the installer has to run as administrator."""
+
+
+AV_BLOCKED = ("Windows Security blocked version.dll. This is a false alarm: the mod loads "
+              "into the game the same way some malware does, so the unsigned DLL gets flagged. "
+              "Open Windows Security > Virus & threat protection > Protection history, "
+              "choose Allow on device for version.dll, then click Install again.")
+
+
+def is_admin():
+    if sys.platform != "win32":
+        return os.geteuid() == 0
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def can_write(game):
+    """True if files can be created in the game folder."""
+    probe = os.path.join(game, ".uiscale-write-test")
+    try:
+        with open(probe, "wb"):
+            pass
+        os.remove(probe)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True  # some other problem: let the install report it
+
+
+def relaunch_as_admin(args):
+    """Starts this installer again elevated (Windows UAC prompt). True if it started."""
+    import ctypes
+    import subprocess
+    if getattr(sys, "frozen", False):
+        exe, params = sys.executable, args
+    else:
+        exe, params = sys.executable, [os.path.abspath(sys.argv[0])] + args
+    r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subprocess.list2cmdline(params),
+                                            None, 1)
+    return r > 32
+
+
+def open_protection_history():
+    try:
+        os.startfile("windowsdefender://threat/")
+    except Exception:
+        pass
+
+
+def write_dll(game):
+    """Copies the mod DLL into the game folder and checks it arrived intact."""
+    data = payload_dll()
+    dst = os.path.join(game, "version.dll")
+    try:
+        with open(dst, "wb") as f:
+            f.write(data)
+        with open(dst, "rb") as f:
+            ok = f.read() == data
+    except PermissionError as e:
+        if getattr(e, "winerror", 0) == 32:  # sharing violation: the game has it loaded
+            raise ValueError("Civilization V is running. Close it and try again.")
+        if is_admin():
+            raise
+        raise NeedsAdmin(game)
+    except OSError as e:
+        # an antivirus block reaches Python as EINVAL ("Invalid argument") or ERROR_VIRUS_*
+        if sys.platform == "win32" and (e.errno == 22 or getattr(e, "winerror", 0) in (225, 226)):
+            raise ValueError(AV_BLOCKED)
+        raise
+    if not ok:
+        raise ValueError(AV_BLOCKED if sys.platform == "win32" else
+                         "version.dll could not be written completely: " + dst)
 
 
 def find_pack(scale, log, progress):
@@ -165,9 +259,11 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
     if state == "foreign":
         raise ValueError("A different version.dll is already in the game folder. "
                          "Remove it first (another mod?) and run the installer again.")
+    if sys.platform == "win32" and not can_write(game):
+        raise NeedsAdmin(game)
     dst = os.path.join(game, "UIScale")
     log("Installing to %s" % game)
-    shutil.copyfile(payload_dll(), os.path.join(game, "version.dll"))
+    write_dll(game)
     # fresh mod files, keep nothing stale from older versions
     for sub in ("Override", "UIArt", "Fonts"):
         shutil.rmtree(os.path.join(dst, sub), ignore_errors=True)
@@ -180,11 +276,11 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
                                    lambda d, t: progress("unlock", d, t))
             log("Unlocked %d of %d files." % (n, total))
             if n < total:
-                notes.append("%d files stay locked: they belong to DLC or versions this "
-                             "install does not have (that is fine)." % (total - n))
+                log("%d files stay locked: they belong to DLC or game versions this install "
+                    "does not have (that is fine)." % (total - n))
         else:
-            notes.append("Hi-res art was not installed (pack not available). The UI "
-                         "scaling and fonts still work.")
+            notes.append("Hi-res art was not installed (art pack not found). Put %s next "
+                         "to the installer and install again." % (PACK_NAME % scale))
     if use_font:
         log("Rendering fonts from %s ..." % use_font)
         render_fonts(game, dst, scale, use_font, log)
@@ -196,7 +292,7 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
                      '    WINEDLLOVERRIDES="version=n,b" %command%')
     ud = locate.user_dir(game)
     if ud:
-        notes.append("Settings and log: %s (UIScale.ini, Logs/UIScale.log)" % ud)
+        log("Settings and log: %s (UIScale.ini, Logs/UIScale.log)" % ud)
     log("Done.")
     return notes
 
@@ -220,6 +316,8 @@ def render_fonts(game, dst, scale, ttf, log):
 
 
 def uninstall(game, log=print):
+    if sys.platform == "win32" and not can_write(game):
+        raise NeedsAdmin(game)
     state = dll_state(game)
     if state == "ours":
         os.remove(os.path.join(game, "version.dll"))

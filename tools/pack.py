@@ -120,6 +120,31 @@ def read_index(path):
     return [struct.unpack_from(INDEX_FMT, raw, i * INDEX_SIZE) for i in range(count)]
 
 
+def _decrypt(f, key, off, length, nonce):
+    f.seek(off)
+    plain = lzma.decompress(_xor(f.read(length), key, nonce))
+    (mlen,) = struct.unpack_from("<I", plain, 0)
+    return json.loads(plain[4:4 + mlen]), plain[4 + mlen:]
+
+
+def unlock(packs, originals):
+    """Hi-res file for each original (bytes), or None where no pack holds one."""
+    index = {}
+    for p in packs:
+        for eid, _size, off, length, nonce in read_index(p):
+            index[eid] = (p, off, length, nonce)
+    out = []
+    for src in originals:
+        key = key_of(src)
+        hit = index.get(entry_id(key))
+        if hit is None:
+            out.append(None)
+            continue
+        with open(hit[0], "rb") as f:
+            out.append(_decrypt(f, key, *hit[1:])[1])
+    return out
+
+
 def unpack(game, packs, dest, progress=None):
     """Unlocks every entry whose original is present. Writes files under dest and the
     UIArt manifests; returns (unlocked, total)."""
@@ -138,15 +163,12 @@ def unpack(game, packs, dest, progress=None):
             continue
         p, _, off, length, nonce = hit
         f = handles.get(p) or handles.setdefault(p, open(p, "rb"))
-        f.seek(off)
-        plain = lzma.decompress(_xor(f.read(length), key, nonce))
-        (mlen,) = struct.unpack_from("<I", plain, 0)
-        meta = json.loads(plain[4:4 + mlen])
+        meta, data = _decrypt(f, key, off, length, nonce)
         for path in meta["paths"]:
             out = os.path.join(dest, *path.split("/"))
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as o:
-                o.write(plain[4 + mlen:])
+                o.write(data)
         if meta.get("manifest"):
             # file entries: next to the file; index stand-ins ("null"): their manifest dir
             mdir = os.path.join(dest, *meta["mdir"].split("/")) if meta.get("mdir") else \

@@ -1,0 +1,32 @@
+// Version resource: identifies the DLL in Explorer and to antivirus scanners.
+#include <winver.h>
+#include "src/version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     UISCALE_VER_MAJOR, UISCALE_VER_MINOR, UISCALE_VER_PATCH, 0
+PRODUCTVERSION  UISCALE_VER_MAJOR, UISCALE_VER_MINOR, UISCALE_VER_PATCH, 0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "FabricatedMatter"
+      VALUE "FileDescription",  "Civ V UI Scale - interface scaling mod for Civilization V"
+      VALUE "FileVersion",      UISCALE_VER_STR
+      VALUE "InternalName",     "version.dll"
+      VALUE "LegalCopyright",   "Open source: github.com/FabricatedMatter/CivV2k4kMod"
+      VALUE "OriginalFilename", "version.dll"
+      VALUE "ProductName",      "Civ V UI Scale"
+      VALUE "ProductVersion",   UISCALE_VER_STR
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
