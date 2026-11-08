@@ -47,6 +47,8 @@ void LoadConfig() {
   g_cfg.shots = ReadString(L"Shots");
   g_cfg.artTrace = ReadString(L"ArtTrace");
   g_cfg.sampleBias = ReadFloat(L"SampleBias", 1.0f) != 0.0f;
+  g_cfg.smoothScaling = ReadFloat(L"SmoothScaling", 1.0f) != 0.0f;
+  g_cfg.backgroundCover = ReadFloat(L"BackgroundCover", 1.0f) != 0.0f;
   g_cfg.shotSave = ReadString(L"ShotSave");
   g_cfg.shotScales = ReadString(L"ShotScales");
   g_cfg.shotLook = ReadString(L"ShotLook");

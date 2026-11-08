@@ -690,6 +690,58 @@ UINT IndexBytes(DXGI_FORMAT f) {
 // FNV-1a over mip 0 in the DDS file's byte order (BGRA), whatever the upload order.
 // Diagnostics: which render target is each replaced texture drawn into?
 std::unordered_map<void*, std::wstring> g_artTex;  // replaced texture -> file name
+// Size / format of each replaced texture: entries are never removed, so a freed texture
+// whose address is reused (e.g. by an index map) must not be taken for hi-res art.
+struct ArtDims {
+  UINT w, h;
+  DXGI_FORMAT f;
+};
+std::unordered_map<void*, ArtDims> g_artDims;
+SRWLOCK g_artLock = SRWLOCK_INIT;
+
+// Is r one of our replaced (hi-res) UI textures?
+bool IsReplacedArt(ID3D11Resource* r) {
+  if (!r) return false;
+  AcquireSRWLockShared(&g_artLock);
+  auto it = g_artDims.find(r);
+  bool known = it != g_artDims.end();
+  ArtDims a = known ? it->second : ArtDims{};
+  ReleaseSRWLockShared(&g_artLock);
+  if (!known) return false;
+  D3D11_RESOURCE_DIMENSION dim;
+  r->GetType(&dim);
+  if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return false;
+  D3D11_TEXTURE2D_DESC d;
+  static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
+  return d.Width == a.w && d.Height == a.h && d.Format == a.f;
+}
+
+// Hi-res font atlases (tools/fontgen.py, served by the file redirect): A8 pages with full
+// mip chains. They are not replaced on upload, but like the art they are drawn smaller
+// than their size at fractional scales, so they are registered for smooth sampling too.
+std::unordered_set<uint64_t> g_fontPages;  // (w << 32 | h) << 8 | mips of the active set
+
+void ScanFontPages(const std::wstring& dir) {
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    std::wstring n = fd.cFileName;
+    if (n == L"." || n == L"..") continue;
+    std::wstring p = dir + L"\\" + n;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      ScanFontPages(p);
+    } else if (n.size() > 4 && _wcsicmp(n.c_str() + n.size() - 4, L".dds") == 0) {
+      uint32_t hdr[32];
+      if (FILE* f = _wfopen(p.c_str(), L"rb")) {
+        if (fread(hdr, 4, 32, f) == 32 && hdr[0] == 0x20534444 /*"DDS "*/ && hdr[22] == 8)
+          g_fontPages.insert((((uint64_t)hdr[4] << 32 | hdr[3]) << 8) | (hdr[7] ? hdr[7] : 1));
+        fclose(f);
+      }
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
 std::unordered_set<std::wstring> g_artBoundLogged;
 
 uint64_t HashMip0(const D3D11_TEXTURE2D_DESC* d, const D3D11_SUBRESOURCE_DATA* init) {
@@ -792,6 +844,21 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
                                           const D3D11_SUBRESOURCE_DATA* init,
                                           ID3D11Texture2D** out) {
   if (g_cfg.dumpPixels && d && init && init->pSysMem && d->ArraySize == 1) DumpTexture(d, init);
+  if (d && init && out && d->Format == DXGI_FORMAT_A8_UNORM && !g_fontPages.empty() &&
+      g_fontPages.count((((uint64_t)d->Width << 32 | d->Height) << 8) | d->MipLevels)) {
+    HRESULT hr = g_origCreateTex2D(dev, d, init, out);
+    if (SUCCEEDED(hr) && *out) {
+      AcquireSRWLockExclusive(&g_artLock);
+      g_artTex[*out] = L"font page";
+      g_artDims[*out] = {d->Width, d->Height, d->Format};
+      size_t n = g_artDims.size();
+      ReleaseSRWLockExclusive(&g_artLock);
+      static int logged = 0;
+      if (++logged <= 3) Log("font page %ux%u registered for smooth scaling (%u art)", d->Width,
+                             d->Height, (unsigned)n);
+    }
+    return hr;
+  }
   if (g_cfg.overlayScale && d && !init && IsScaledOverlay(d)) {
     D3D11_TEXTURE2D_DESC sd = *d;
     UINT f = (UINT)g_cfg.overlayScale;
@@ -884,7 +951,10 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
           HRESULT hr = g_origCreateTex2D(dev, &hd, sub.data(), out);
           if (SUCCEEDED(hr)) {
             const std::wstring& fn = it->second.file;
+            AcquireSRWLockExclusive(&g_artLock);
             g_artTex[*out] = fn.substr(fn.rfind(L'\\') + 1);
+            g_artDims[*out] = {hd.Width, hd.Height, hd.Format};
+            ReleaseSRWLockExclusive(&g_artLock);
             if (++g_artReplaced <= 200 || g_artReplaced % 100 == 0 || g_cfg.dumpTextures) {
               const std::wstring& f = it->second.file;
               Log("UI art replaced #%d: %ux%u -> %ux%u %ls", g_artReplaced, d->Width, d->Height,
@@ -912,6 +982,12 @@ CreateWindowExAFn g_origCreateWindowExA = nullptr;
 
 CRITICAL_SECTION g_cs;
 std::unordered_set<void*> g_patched;
+// UI pixel shaders (clip- or sprite-patched): the only draws smooth scaling may touch
+std::unordered_set<void*> g_uiPS;
+// Per thread (each context is recorded by one thread at a time): the context whose last
+// PSSetShader was seen here, and whether that shader is a UI shader.
+thread_local ID3D11DeviceContext* t_smCtx = nullptr;
+thread_local bool t_smUI = false;
 ID3D11Buffer* volatile g_scaleBuf = nullptr;
 volatile float g_bufScale = -1.0f;
 int g_patchedCount = 0;
@@ -1019,6 +1095,7 @@ HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device* dev, const void* bc, S
   if (SUCCEEDED(hr) && clip && out && *out) {
     EnterCriticalSection(&g_cs);
     g_patched.insert(*out);
+    g_uiPS.insert(*out);
     int n = ++g_patchedCount;
     LeaveCriticalSection(&g_cs);
     if (n <= 3 || n % 10 == 0)
@@ -1029,6 +1106,7 @@ HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device* dev, const void* bc, S
     if (out && *out) {
       EnterCriticalSection(&g_cs);
       g_spritePS.insert(*out);
+      g_uiPS.insert(*out);
       LeaveCriticalSection(&g_cs);
     }
   }
@@ -1044,9 +1122,12 @@ void STDMETHODCALLTYPE HookPSSetShader(ID3D11DeviceContext* ctx, ID3D11PixelShad
                                        ID3D11ClassInstance* const* ci, UINT n) {
   g_origPSSetShader[W](ctx, ps, ci, n);
   g_curPS[W] = ps;
+  t_smCtx = ctx;
+  t_smUI = false;
   if (!ps) return;
   EnterCriticalSection(&g_cs);
   bool ours = g_patched.count(ps) != 0;
+  t_smUI = g_uiPS.count(ps) != 0;
   LeaveCriticalSection(&g_cs);
   if (!ours) return;
   ID3D11Buffer* buf = g_scaleBuf;
@@ -1099,6 +1180,171 @@ bool ArtTraced(const std::wstring& name) {
 
 UINT g_ovlRTSize[2] = {};  // overlay diagnostics: size of the bound overlay page (0 = none)
 std::unordered_set<void*> g_ovlPSLogged;
+// ------------------------------------------------- smooth fractional scaling
+// The UI samples with nearest filtering. At integer scales the k x art maps texel per
+// pixel, but at fractional ones (150 %: 4 texels on 3 pixels) nearest sampling drops
+// texels unevenly: stair-steps on diagonals and thin lines. While the scale is
+// fractional, a slot whose texture is replaced hi-res art gets a bilinear copy of its
+// point sampler (same addressing). Texture slot N is assumed to use sampler slot N, as
+// in all of the game's UI shaders; index maps and the game's own textures keep theirs.
+struct LinearSampler {
+  D3D11_SAMPLER_DESC desc;  // the game sampler's description when the copy was made
+  ID3D11SamplerState* lin;  // bilinear copy (or the sampler itself if not point-filtered)
+};
+std::unordered_map<ID3D11SamplerState*, LinearSampler> g_linearOf;
+SRWLOCK g_smpLock = SRWLOCK_INIT;
+
+bool FractionalScale() {
+  if (!g_cfg.smoothScaling || !IsActive()) return false;
+  float sc = EffectiveScale();
+  return fabsf(sc - roundf(sc)) > 0.01f;
+}
+
+ID3D11SamplerState* LinearFor(ID3D11SamplerState* smp) {
+  if (!smp) return nullptr;
+  D3D11_SAMPLER_DESC d;
+  smp->GetDesc(&d);
+  AcquireSRWLockShared(&g_smpLock);
+  auto it = g_linearOf.find(smp);
+  ID3D11SamplerState* hit =
+      it != g_linearOf.end() && memcmp(&it->second.desc, &d, sizeof d) == 0 ? it->second.lin
+                                                                             : nullptr;
+  ReleaseSRWLockShared(&g_smpLock);
+  if (hit) return hit;
+  ID3D11SamplerState* lin = smp;
+  if (d.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ||
+      d.Filter == D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR) {
+    D3D11_SAMPLER_DESC ld = d;
+    // nearest mip: the art and font pages are drawn at 0.6-1x of their size, where a blend
+    // with the half-size mip would only blur
+    ld.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    ID3D11Device* dev = nullptr;
+    smp->GetDevice(&dev);
+    ID3D11SamplerState* made = nullptr;
+    if (dev && SUCCEEDED(dev->CreateSamplerState(&ld, &made)) && made) lin = made;  // kept
+    if (dev) dev->Release();
+    static int n = 0;
+    if (++n <= 4) Log("smooth scaling: bilinear copy of point sampler %p -> %p", (void*)smp,
+                      (void*)lin);
+  }
+  AcquireSRWLockExclusive(&g_smpLock);
+  g_linearOf[smp] = {d, lin};
+  ReleaseSRWLockExclusive(&g_smpLock);
+  return lin;
+}
+
+// Draw-time substitution (no state tracking: deferred contexts are recorded in parallel
+// and share method tables). Only for UI shaders, only at fractional scales: the bound
+// textures and samplers are queried from the context itself, bilinear copies are bound
+// for hi-res art / font page slots for this one draw, and the game's samplers restored.
+constexpr UINT kSmoothSlots = 4;
+constexpr int kVtDrawIndexedInstanced = 20, kVtDrawInstanced = 21;
+using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT,
+                                                        INT, UINT);
+using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
+DrawIndexedInstancedFn g_origDrawIndexedInst[2] = {};
+DrawInstancedFn g_origDrawInst[2] = {};
+bool g_smoothDraws = false;  // set when the draw hooks are installed for smooth scaling
+
+// Full-screen backgrounds: the engine's loading pictures (Loading_<n>.dds,
+// LoadingBaseGame_<n>.dds) and the front-end background (CivilzationVAtlas.dds) are
+// 1920x1200 BC1 textures drawn centred at 1920x1200 UI units. That covers a 1920x1080
+// layout (100 % at 1080p, 200 % at 4K) but leaves black borders at other scales (150 %
+// on 4K lays out 2560x1440). Such draws get a viewport enlarged around its centre by the
+// cover factor, so the picture fills the screen and is cropped like at 1080p.
+bool g_coverDraws = false;  // draw hooks installed for this
+
+float CoverFactor() {
+  if (!g_coverDraws || g_cfg.vanilla || !IsActive()) return 1.0f;
+  if (fabsf(EffectiveScale() - 1.0f) < 0.01f) return 1.0f;  // the game's own behaviour
+  int vw = 0, vh = 0;
+  GetVirtualSize(&vw, &vh);
+  float f = vw > 0 && vh > 0 ? fmaxf(vw / 1920.0f, vh / 1200.0f) : 1.0f;
+  return f > 1.002f ? f : 1.0f;
+}
+
+bool IsFullscreenBackground(ID3D11Resource* r) {
+  D3D11_RESOURCE_DIMENSION dim;
+  r->GetType(&dim);
+  if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return false;
+  D3D11_TEXTURE2D_DESC d;
+  static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
+  return d.Width == 1920 && d.Height == 1200 &&
+         (d.Format == DXGI_FORMAT_BC1_TYPELESS || d.Format == DXGI_FORMAT_BC1_UNORM ||
+          d.Format == DXGI_FORMAT_BC1_UNORM_SRGB);
+}
+
+// Per draw: bilinear samplers for hi-res art at fractional scales and the background
+// cover; both decided from what the context has bound, and undone after the draw.
+struct SmoothDraw {
+  ID3D11DeviceContext* c = nullptr;
+  ID3D11SamplerState* orig[kSmoothSlots] = {};
+  bool samplers = false;
+  bool viewport = false;
+  D3D11_VIEWPORT oldVp = {};
+
+  explicit SmoothDraw(ID3D11DeviceContext* ctx) {
+    bool smooth = g_smoothDraws && FractionalScale();
+    float cover = CoverFactor();
+    if (!smooth && cover == 1.0f) return;
+    ID3D11ShaderResourceView* srv[kSmoothSlots] = {};
+    ctx->PSGetShaderResources(0, kSmoothSlots, srv);
+    if (smooth) ctx->PSGetSamplers(0, kSmoothSlots, orig);
+    ID3D11SamplerState* use[kSmoothSlots];
+    bool background = false;
+    for (UINT i = 0; i < kSmoothSlots; ++i) {
+      use[i] = orig[i];
+      if (!srv[i]) continue;
+      ID3D11Resource* r = nullptr;
+      srv[i]->GetResource(&r);
+      if (r) {
+        if (smooth && orig[i] && IsReplacedArt(r)) {
+          ID3D11SamplerState* lin = LinearFor(orig[i]);
+          if (lin && lin != orig[i]) {
+            use[i] = lin;
+            samplers = true;
+          }
+        }
+        if (cover != 1.0f && i == 0 && IsFullscreenBackground(r)) background = true;
+        r->Release();
+      }
+    }
+    for (auto* v : srv)
+      if (v) v->Release();
+    c = ctx;
+    if (samplers) ctx->PSSetSamplers(0, kSmoothSlots, use);
+    if (background) {
+      UINT n = 1;
+      ctx->RSGetViewports(&n, &oldVp);
+      if (n == 1 && oldVp.Width > 0 && oldVp.Height > 0) {
+        D3D11_VIEWPORT vp = oldVp;
+        vp.Width = oldVp.Width * cover;
+        vp.Height = oldVp.Height * cover;
+        vp.TopLeftX = oldVp.TopLeftX - (vp.Width - oldVp.Width) * 0.5f;
+        vp.TopLeftY = oldVp.TopLeftY - (vp.Height - oldVp.Height) * 0.5f;
+        ctx->RSSetViewports(1, &vp);
+        viewport = true;
+        static int logged = 0;
+        if (++logged <= 3) Log("background cover: x%.3f (viewport %.0fx%.0f)", cover, vp.Width,
+                               vp.Height);
+      }
+    }
+    if (!samplers) Release();
+  }
+  void Release() {
+    for (auto*& o : orig)
+      if (o) {
+        o->Release();
+        o = nullptr;
+      }
+  }
+  ~SmoothDraw() {
+    if (samplers) c->PSSetSamplers(0, kSmoothSlots, orig);  // the game's state again
+    if (viewport) c->RSSetViewports(1, &oldVp);
+    Release();
+  }
+};
+
 template <int S>
 void NoteDraw() {
   if (g_ovlRTSize[S] && g_ovlPSLogged.size() < 60 && g_ovlPSLogged.insert(g_curPS[S]).second) {
@@ -1122,13 +1368,27 @@ void NoteDraw() {
 }
 template <int S>
 void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* c, UINT n, UINT i0, INT b) {
-  NoteDraw<S>();
+  if (g_cfg.dumpTextures) NoteDraw<S>();
+  SmoothDraw sm(c);
   g_origDrawIndexed[S](c, n, i0, b);
 }
 template <int S>
 void STDMETHODCALLTYPE HookDraw(ID3D11DeviceContext* c, UINT n, UINT v0) {
-  NoteDraw<S>();
+  if (g_cfg.dumpTextures) NoteDraw<S>();
+  SmoothDraw sm(c);
   g_origDraw[S](c, n, v0);
+}
+template <int S>
+void STDMETHODCALLTYPE HookDrawIndexedInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT i0,
+                                           INT b, UINT s0) {
+  SmoothDraw sm(c);
+  g_origDrawIndexedInst[S](c, n, inst, i0, b, s0);
+}
+template <int S>
+void STDMETHODCALLTYPE HookDrawInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT v0,
+                                    UINT s0) {
+  SmoothDraw sm(c);
+  g_origDrawInst[S](c, n, inst, v0, s0);
 }
 
 template <int S>
@@ -1147,7 +1407,7 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* c, UINT start, UINT n,
     }
     g_boundArt[S][start + i] = a;
   }
-  if (v && !g_artTex.empty()) {
+  if (g_cfg.dumpTextures && v && !g_artTex.empty()) {
     for (UINT i = 0; i < n; ++i) {
       if (!v[i]) continue;
       ID3D11Resource* r = nullptr;
@@ -1462,14 +1722,28 @@ void HookContextVt(ID3D11DeviceContext* ctx) {
       PatchVt(vt, kVtOMSetRT, slot == 0 ? (void*)&DiagOMSetRT<0> : (void*)&DiagOMSetRT<1>,
               reinterpret_cast<void**>(&g_origOMSetRTDiag[slot]));
   }
+  bool smooth = g_cfg.smoothScaling && (!g_art.empty() || !g_fontPages.empty());
+  bool cover = g_cfg.backgroundCover && !g_cfg.vanilla && IsActive();
   if (g_cfg.dumpTextures) {
     PatchVt(vt, kVtPSSetSRV, slot == 0 ? (void*)&HookPSSetSRV<0> : (void*)&HookPSSetSRV<1>,
             reinterpret_cast<void**>(&g_origPSSetSRV[slot]));
+  }
+  if (g_cfg.dumpTextures || smooth || cover) {
+    if (smooth) g_smoothDraws = true;
+    if (cover) g_coverDraws = true;
     PatchVt(vt, kVtDrawIndexed,
             slot == 0 ? (void*)&HookDrawIndexed<0> : (void*)&HookDrawIndexed<1>,
             reinterpret_cast<void**>(&g_origDrawIndexed[slot]));
     PatchVt(vt, kVtDraw, slot == 0 ? (void*)&HookDraw<0> : (void*)&HookDraw<1>,
             reinterpret_cast<void**>(&g_origDraw[slot]));
+  }
+  if (smooth || cover) {
+    PatchVt(vt, kVtDrawIndexedInstanced,
+            slot == 0 ? (void*)&HookDrawIndexedInst<0> : (void*)&HookDrawIndexedInst<1>,
+            reinterpret_cast<void**>(&g_origDrawIndexedInst[slot]));
+    PatchVt(vt, kVtDrawInstanced,
+            slot == 0 ? (void*)&HookDrawInst<0> : (void*)&HookDrawInst<1>,
+            reinterpret_cast<void**>(&g_origDrawInst[slot]));
   }
 }
 
@@ -1492,7 +1766,13 @@ void HookFromDevice(ID3D11Device* dev, ID3D11DeviceContext* imm, const char* how
     if (s > 2.5f) LoadArtManifest(L"x3");
     if (g_art.empty()) LoadArtManifest(L"x2");  // releases ship 2x only
   }
-  if (!g_art.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
+  if (g_cfg.crispFonts && g_cfg.smoothScaling && s >= 1.25f) {  // same choice as main.cpp
+    std::wstring x3 = g_modDir + L"\\Fonts\\x3";
+    bool use3 = s > 2.5f && GetFileAttributesW(x3.c_str()) != INVALID_FILE_ATTRIBUTES;
+    ScanFontPages(g_modDir + (use3 ? L"\\Fonts\\x3" : L"\\Fonts\\x2"));
+    Log("smooth scaling: %u font page sizes", (unsigned)g_fontPages.size());
+  }
+  if (!g_art.empty() || !g_fontPages.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
     PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
             reinterpret_cast<void**>(&g_origCreateTex2D));
   if (imm) HookContextVt(imm);

@@ -26,6 +26,12 @@ struct Config {
   // name contains one of these strings, with its pixel shader (no 300-draw cap)
   std::wstring artTrace;
   bool sampleBias = true;  // SampleBias=0: no 1/32 px sample-point bias in UI shaders
+  // SmoothScaling=0: keep nearest-texel sampling of the hi-res art at fractional scales
+  // (e.g. 150 %, where it drops texels unevenly); integer scales are never filtered
+  bool smoothScaling = true;
+  // BackgroundCover=0: keep the 1920x1200 front-end / loading backgrounds at their size
+  // (at scales other than 100 % they are enlarged to cover the screen, like at 1080p)
+  bool backgroundCover = true;
   // Screenshot automation (tools/shots.py). Vanilla=1: the mod stays loaded but renders
   // like the unmodded game (scale 1, original art, fonts and borders), so the same driver
   // can take the "before" shots.
