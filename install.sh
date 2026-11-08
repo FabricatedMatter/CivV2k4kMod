@@ -39,7 +39,14 @@ cp -r "$HERE/build/Fonts" "$GAME/UIScale/Fonts"
 # AI-upscaled UI art, if built (tools/uiart.py)
 if [[ -d "$HERE/build/UIArt" ]]; then
   mkdir -p "$GAME/UIScale/UIArt"
-  cp -r "$HERE/build/UIArt/x2" "$HERE/build/UIArt/x3" "$GAME/UIScale/UIArt/"
+  # 2x only, like the release packs (above 250 % the DLL scales the 2x art)
+  cp -r "$HERE/build/UIArt/x2" "$GAME/UIScale/UIArt/"
+fi
+# Hi-res art built on this PC from art that is not ours to ship (Enhanced UI's own icons:
+# tools/uiart.py build GAME build/UIArt_eui --eui ...); loaded on top of UIArt
+if [[ -d "$HERE/build/UIArt_eui" && -d "$GAME/Assets/DLC/UI_bc1" ]]; then
+  mkdir -p "$GAME/UIScale/UIArt_local"
+  cp -r "$HERE/build/UIArt_eui/." "$GAME/UIScale/UIArt_local/"
 fi
 
 echo "Installed to: $GAME"

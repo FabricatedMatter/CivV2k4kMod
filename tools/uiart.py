@@ -358,12 +358,26 @@ def contact_sheet(rows, path_base, k, per_page=24, max_w=160):
 UI_ARCHIVES = {"uitextures": "", "expansion1uitextures": "e1", "expansion2uitextures": "e2"}
 
 
-def load_sources(game):
+EUI_DIR = os.path.join("Assets", "DLC", "UI_bc1")
+
+
+def load_sources(game, eui=False):
     """[(tag, name, off, size, data)] from every DX9 texture archive plus loose DDS files
     under Assets/**/UI/. tag: "" / e1 / e2 for the three UI archives, the archive name
-    for other archives, "loose-<dir>" for loose files. UI archives are flagged by is_ui()."""
+    for other archives, "loose-<dir>" for loose files. UI archives are flagged by is_ui().
+    eui: only Enhanced UI's own textures (Assets/DLC/UI_bc1), tagged "loose-eui-<subdir>"
+    (zArt1 / zArt2 hold same-named G&K / BNW versions). Built for the local art set only:
+    EUI's license does not allow shipping its art."""
     import glob
     out = []
+    if eui:
+        root = os.path.join(game, EUI_DIR)
+        for path in sorted(glob.glob(os.path.join(root, "**", "*.dds"), recursive=True)):
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            sub = rel.split("/")[0].lower() if "/" in rel else "root"
+            data = open(path, "rb").read()
+            out.append(("loose-eui-" + sub, os.path.basename(path), 0, len(data), data))
+        return out
     for path in sorted(glob.glob(os.path.join(game, "Resource", "DX9", "*.fpk"))):
         base = os.path.basename(path).lower()[:-4]
         tag = UI_ARCHIVES.get(base, base.replace("textures", ""))
@@ -516,6 +530,9 @@ def main():
     ap.add_argument("--scales", default="2,3", help="output scales, e.g. 2 or 2,3")
     ap.add_argument("--resume", action="store_true",
                     help="skip textures whose outputs already exist in OUT_DIR")
+    ap.add_argument("--eui", action="store_true",
+                    help="build Enhanced UI's own textures (Assets/DLC/UI_bc1) instead of the "
+                         "game's; for a local art set only, never ship them")
     ap.add_argument("--max-size", type=int, default=1024,
                     help="skip textures whose (assembled) image is larger than this")
     a = ap.parse_args()
@@ -526,7 +543,7 @@ def main():
     # Base game, G&K, BNW, patches and DLC each ship their own versions of many UI
     # textures; which one the game uploads depends on what the player has installed, so
     # build every distinct version (the DLL matches by content hash).
-    entries = load_sources(a.game)
+    entries = load_sources(a.game, a.eui)
     load_atlas_files(a.game)
     # "-index" tile sprites: the data texture is replaced, the index map stays (uisprite.py)
     index_maps = {(tag, n.lower()[:-len("-index.dds")]): data[off:off + size]
@@ -588,6 +605,8 @@ def main():
         else:
             it["src"] = it["data"]
         if max(it["src"].shape[:2]) > a.max_size:
+            continue
+        if min(it["src"].shape[:2]) < 2:  # 1x1 placeholders (EUI ships some)
             continue
         if a.resume and all(os.path.exists(os.path.join(a.out, "x%d" % k, it["name"][:-4] +
                                                         "_x%d.dds" % k)) for k in SCALES):

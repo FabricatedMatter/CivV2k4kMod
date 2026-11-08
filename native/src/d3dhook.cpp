@@ -635,10 +635,13 @@ std::unordered_map<uint64_t, ArtEntry> g_art;
 std::unordered_set<uint64_t> g_artSizes;  // (w << 32 | h) quick reject
 int g_artReplaced = 0, g_artMisses = 0;
 
-void LoadArtManifest(const wchar_t* k) {
-  std::wstring dir = g_modDir + L"\\UIArt\\" + k + L"\\";
+// root: UIArt (shipped) or UIArt_local (built on this PC from art that may not be shipped,
+// e.g. Enhanced UI's: tools/uiart.py --eui). Returns the number of entries read.
+size_t LoadArtManifest(const wchar_t* k, const wchar_t* root = L"UIArt") {
+  std::wstring dir = g_modDir + L"\\" + root + L"\\" + k + L"\\";
   FILE* f = _wfopen((dir + L"uiart.txt").c_str(), L"r");
-  if (!f) return;
+  if (!f) return 0;
+  size_t n = 0;
   char hash[32], file[260];
   unsigned w, h, kk;
   while (fscanf(f, "%31s %u %u %u %259s", hash, &w, &h, &kk, file) == 5) {
@@ -646,9 +649,11 @@ void LoadArtManifest(const wchar_t* k) {
     MultiByteToWideChar(CP_UTF8, 0, file, -1, wf, 260);
     g_art[strtoull(hash, nullptr, 16)] = ArtEntry{w, h, kk, dir + wf};
     g_artSizes.insert(((uint64_t)w << 32) | h);
+    ++n;
   }
   fclose(f);
-  Log("AI-upscaled UI art: %u textures (%ls)", (unsigned)g_art.size(), k);
+  Log("AI-upscaled UI art: %u textures (%ls\\%ls)", (unsigned)n, root, k);
+  return n;
 }
 
 // 32-bit formats the engine uses for UI art. The DX11 renderer uploads the (BGRA) DDS
@@ -1765,6 +1770,7 @@ void HookFromDevice(ID3D11Device* dev, ID3D11DeviceContext* imm, const char* how
   if (g_cfg.aiArt && s >= 1.25f) {
     if (s > 2.5f) LoadArtManifest(L"x3");
     if (g_art.empty()) LoadArtManifest(L"x2");  // releases ship 2x only
+    if (!(s > 2.5f && LoadArtManifest(L"x3", L"UIArt_local"))) LoadArtManifest(L"x2", L"UIArt_local");
   }
   if (g_cfg.crispFonts && g_cfg.smoothScaling && s >= 1.25f) {  // same choice as main.cpp
     std::wstring x3 = g_modDir + L"\\Fonts\\x3";
