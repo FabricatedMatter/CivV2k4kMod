@@ -229,7 +229,7 @@ class Setup:
         y += 32
         self.font_info = self.text(L + 34, y, "", self.f_small, MUTED, width=R - L - 34)
         form.append(self.font_info)
-        y += 40
+        y += 54
         self.again_link = Link(self, L + 34, y, "Check again", self.refresh_font)
         self.ttf_link = Link(self, L + 34 + self.again_link.width + 22, y, "Choose .ttf file…",
                              self.browse_font)
@@ -414,7 +414,7 @@ class Setup:
             self.font_info.set("Found: %s" % p, MUTED)
         else:
             self.font_check.set(False, enabled=False)
-            self.font_info.set(core.FONT_HINT, MUTED)
+            self.font_info.set(core.FONT_HINT, WARN)
 
     def browse_game(self):
         d = filedialog.askdirectory(parent=self.root,
@@ -768,8 +768,24 @@ def haloed(img):
 
 
 # ---------------------------------------------------------------- icon
+LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+
+
+def load_logo():
+    """The installer's logo (installer/logo.png), RGBA, or None."""
+    for p in (LOGO, os.path.join(core.BUNDLE, "installer", "logo.png")):
+        try:
+            return Image.open(p).convert("RGBA")
+        except OSError:
+            continue
+    return None
+
+
 def app_icon(size):
-    """Small emblem for the taskbar / exe (drawn, no game art): a gold ring on teal."""
+    """Taskbar / exe icon: the logo, or a drawn emblem without it."""
+    logo = load_logo()
+    if logo:
+        return logo.resize((size, size), Image.LANCZOS)
     from PIL import ImageDraw
     k = 4
     n = size * k

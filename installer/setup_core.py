@@ -131,8 +131,9 @@ def find_font():
     return None
 
 
-FONT_HINT = ("Not installed. Optional: the mod ships its own glyphs. For the real font, "
-             "install Tw Cen MT (.ttf) and check again.")
+FONT_HINT = ("For the font to render correctly at larger scales, you need to download and "
+             "install the font on this computer or download it and point the mod at it. "
+             "Otherwise your fonts will look wonky!")
 
 
 # ------------------------------------------------------------------ install

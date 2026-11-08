@@ -37,10 +37,10 @@ you can also pick the folder yourself. Run it again to update, change options or
 
 ### Font
 
-Civ V uses *Tw Cen MT*. If that font is installed on your computer, the installer offers to render
-the game's text from it (the best quality). Without it the mod still ships crisp reconstructed
-glyphs. The font is easy to find: search the web for "Tw Cen MT font download", install the .ttf
-like any font, and run the installer again.
+Civ V uses *Tw Cen MT*. For the text to render correctly at larger scales, install that font on
+your computer (or download the .ttf and point the installer at it with *Choose .ttf file…*); the
+installer then renders the game's text from it. Without it the fonts look wonky. The font is easy
+to find: search the web for "Tw Cen MT font download".
 
 ### Where does the hi-res art come from?
 

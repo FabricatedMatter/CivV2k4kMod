@@ -58,6 +58,7 @@ jobs:
           --add-data "payload/version.bin:payload"
           --add-data "mod:payload/mod"
           --add-data "tools:tools"
+          --add-data "installer/logo.png:installer"
           --hidden-import numpy --hidden-import PIL.Image --hidden-import PIL.ImageFont
           --hidden-import PIL.ImageDraw --hidden-import PIL.ImageFilter --hidden-import PIL.ImageTk
           --hidden-import setup_gui --hidden-import skin --hidden-import bcn
