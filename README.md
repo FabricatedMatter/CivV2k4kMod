@@ -11,16 +11,6 @@ any combination of DLC. The native Linux port of Civ V (OpenGL) is not supported
 
 Works with Enhanced UI (EUI) and Vox Populi's EUI.
 
-## Screenshots
-
-![City banner and unit flags](docs/panels_city_banner.jpg)
-![Main menu](docs/panels_main_menu.jpg)
-![Tech tree](docs/panels_tech_tree.jpg)
-![Social policies](docs/panels_social_policies.jpg)
-![UI Scale option](docs/ui_scale_option.jpg)
-![UI Scale 100, 150 and 200 %](docs/scaling_100_150_200.jpg)
-![EUI support](docs/eui_support.jpg)
-
 ## Install
 
 **Windows:** download `CivVUIScale-Setup.exe` from the latest release (to the right on this page) and run it. It fetches
@@ -47,6 +37,17 @@ WINEDLLOVERRIDES="version=n,b" %command%
 
 The installer finds the game in any Steam library (other drives, Flatpak / Snap Steam included);
 you can also pick the folder yourself. Run it again to update, change options or uninstall.
+
+## Screenshots
+
+![City banner and unit flags](docs/panels_city_banner.jpg)
+![Main menu](docs/panels_main_menu.jpg)
+![Tech tree](docs/panels_tech_tree.jpg)
+![Social policies](docs/panels_social_policies.jpg)
+![UI Scale option](docs/ui_scale_option.jpg)
+![UI Scale 100, 150 and 200 %](docs/scaling_100_150_200.jpg)
+![EUI support](docs/eui_support.jpg)
+
 
 ### Font
 
