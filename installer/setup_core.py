@@ -76,6 +76,48 @@ def installer_dir():
     return os.path.dirname(HERE)
 
 
+def host_env():
+    """Environment for programs of the host system (fc-list, xrdb). The Linux one-file build
+    points LD_LIBRARY_PATH at its own bundled libraries; system programs must not load those
+    (an old bundled libfontconfig cannot read a newer system's font configuration)."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+# CA bundles of the common distros (Debian/Ubuntu/Arch, Fedora/RHEL, openSUSE, Alpine/macOS)
+CA_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/ca-bundle.pem",
+            "/etc/ssl/cert.pem")
+
+
+def ssl_context():
+    """TLS context with a CA bundle that exists on this system. The OpenSSL inside the
+    Linux build looks for certificates where its build machine keeps them, which fails on
+    other distros (CERTIFICATE_VERIFY_FAILED)."""
+    import ssl
+    if sys.platform == "win32":
+        return ssl.create_default_context()
+    for p in (os.environ.get("SSL_CERT_FILE"),) + CA_FILES:
+        if p and os.path.isfile(p):
+            return ssl.create_default_context(cafile=p)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def plain_log(msg, kind="info"):
+    """Default log: kind is one of step, info, ok, warn, error (front ends may colour it)."""
+    print(msg)
+
+
 # ------------------------------------------------------------------ status
 def dll_state(game, name=None):
     """'none', 'ours' or 'foreign' for the mod DLL (DLL_NAME) in the game folder."""
@@ -116,7 +158,8 @@ def find_font():
         try:
             import subprocess
             out = subprocess.run(["fc-list", ":family=Tw Cen MT", "file", "style"],
-                                 capture_output=True, text=True, timeout=10).stdout
+                                 capture_output=True, text=True, timeout=10,
+                                 env=host_env()).stdout
             for line in out.splitlines():
                 path = line.split(":")[0].strip()
                 if path and "bold" not in line.lower() and "italic" not in line.lower() \
@@ -236,9 +279,9 @@ def remove_other_dlls(game, log):
         if dll_state(game, n) == "ours":
             try:
                 os.remove(os.path.join(game, n))
-                log("Removed the old %s (the mod now uses %s)" % (n, DLL_NAME))
+                log("Removed the old %s (the mod now uses %s)" % (n, DLL_NAME), "info")
             except OSError as e:
-                log("Could not remove the old %s: %s" % (n, e))
+                log("Could not remove the old %s: %s" % (n, e), "warn")
 
 
 def find_pack(scale, log, progress):
@@ -247,11 +290,13 @@ def find_pack(scale, log, progress):
     for d in (installer_dir(), os.path.join(installer_dir(), "packs"), os.getcwd()):
         p = os.path.join(d, name)
         if os.path.isfile(p):
+            log("Using the art pack next to the installer: %s" % p, "info")
             return p
     dest = os.path.join(installer_dir(), name)
-    log("Downloading %s ..." % name)
+    log("Downloading %s from the latest GitHub release ..." % name, "step")
     try:
-        with urllib.request.urlopen(RELEASE_URL + name, timeout=60) as r, \
+        with urllib.request.urlopen(RELEASE_URL + name, timeout=60,
+                                    context=ssl_context()) as r, \
                 open(dest + ".part", "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             got = 0
@@ -264,14 +309,20 @@ def find_pack(scale, log, progress):
                 if total:
                     progress("download", got, total)
         os.replace(dest + ".part", dest)
+        log("Downloaded %s" % dest, "ok")
         return dest
     except Exception as e:
-        log("Download failed: %s" % e)
-        log("Put %s next to the installer and run it again." % name)
+        try:
+            os.remove(dest + ".part")
+        except OSError:
+            pass
+        log("Download failed: %s" % e, "error")
+        log("Download %s from %s yourself, put it next to the installer and run it "
+            "again." % (name, RELEASE_URL.rsplit("/latest/", 1)[0] + "/latest"), "warn")
         return None
 
 
-def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a: None):
+def install(game, scale, use_font=None, art=True, log=plain_log, progress=lambda *a: None):
     """Installs into game. use_font: path of the user's Tw Cen MT or None.
     Returns a list of follow-up notes for the user."""
     notes = []
@@ -284,8 +335,9 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
     if sys.platform == "win32" and not can_write(game):
         raise NeedsAdmin(game)
     dst = os.path.join(game, "UIScale")
-    log("Installing to %s" % game)
+    log("Installing to %s" % game, "step")
     write_dll(game)
+    log("Installed %s" % DLL_NAME, "ok")
     remove_other_dlls(game, log)
     # fresh mod files, keep nothing stale from older versions
     for sub in ("Override", "UIArt", "Fonts"):
@@ -294,29 +346,29 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
     if art:
         p = find_pack(scale, log, progress)
         if p:
-            log("Unlocking hi-res art with your game files ...")
+            log("Unlocking hi-res art with your game files ...", "step")
             n, total = pack.unpack(game, [p], dst,
                                    lambda d, t: progress("unlock", d, t))
-            log("Unlocked %d of %d files." % (n, total))
+            log("Unlocked %d of %d files." % (n, total), "ok" if n else "error")
             if n < total:
                 log("%d files stay locked: they belong to DLC or game versions this install "
-                    "does not have (that is fine)." % (total - n))
+                    "does not have (that is fine)." % (total - n), "info")
         else:
             notes.append("Hi-res art was not installed (art pack not found). Put %s next "
                          "to the installer and install again." % (PACK_NAME % scale))
     if use_font:
-        log("Rendering fonts from %s ..." % use_font)
+        log("Rendering fonts from %s ..." % use_font, "step")
         render_fonts(game, dst, scale, use_font, log)
     if os.path.isdir(os.path.join(game, "Assets", "DLC", "UI_bc1")):
         log("Enhanced UI detected: the UI Scale slider is added to EUI's options menu "
-            "automatically.")
+            "automatically.", "ok")
     if sys.platform != "win32":
         notes.append('Steam: right-click Civilization V > Properties > Launch Options:\n'
                      '    WINEDLLOVERRIDES="version=n,b" %command%')
     ud = locate.user_dir(game)
     if ud:
-        log("Settings and log: %s (UIScale.ini, Logs/UIScale.log)" % ud)
-    log("Done.")
+        log("Settings and log: %s (UIScale.ini, Logs/UIScale.log)" % ud, "info")
+    log("Done.", "ok")
     return notes
 
 
@@ -335,20 +387,20 @@ def render_fonts(game, dst, scale, ttf, log):
         out = os.path.join(dst, "Fonts", "x%d" % scale)
         shutil.rmtree(out, ignore_errors=True)
         shutil.copytree(os.path.join(td, "x%d" % scale), out)
-    log("Fonts rendered from your Tw Cen MT.")
+    log("Fonts rendered from your Tw Cen MT.", "ok")
 
 
-def uninstall(game, log=print):
+def uninstall(game, log=plain_log):
     if sys.platform == "win32" and not can_write(game):
         raise NeedsAdmin(game)
     for n in [DLL_NAME] + OTHER_DLL_NAMES:
         state = dll_state(game, n)
         if state == "ours":
             os.remove(os.path.join(game, n))
-            log("Removed %s" % n)
+            log("Removed %s" % n, "ok")
         elif state == "foreign" and n == DLL_NAME:
-            log("Left %s alone (it is not ours)." % n)
+            log("Left %s alone (it is not ours)." % n, "warn")
     shutil.rmtree(os.path.join(game, "UIScale"), ignore_errors=True)
-    log("Removed UIScale/. Uninstalled.")
+    log("Removed UIScale/. Uninstalled.", "ok")
     if sys.platform != "win32":
-        log('You can remove the WINEDLLOVERRIDES launch option in Steam again.')
+        log('You can remove the WINEDLLOVERRIDES launch option in Steam again.', "info")

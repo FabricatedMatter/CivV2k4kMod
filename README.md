@@ -26,8 +26,9 @@ I get that that might be scary. You can verify all the code yourself and build t
 On Windows the strategic-view icon alignment is broken and cant be fixed, due to Steam DRM not allowing my workaround on windows for some reason (Thanks Valve/Microsoft).
 On Linux it works no problem.
 
-**Linux:** download `civ5-uiscale-setup-linux.tar.gz`, unpack it and run `./install.sh`.
-Then set the Steam launch options of Civilization V to
+**Linux:** download `civ5-uiscale-setup-linux.tar.gz`, unpack it and run `./install.sh`. It opens
+the setup window and fetches the art pack itself, like on Windows (`./install.sh --cli` installs
+from the terminal instead). Then set the Steam launch options of Civilization V to
 
 ```
 WINEDLLOVERRIDES="version=n,b" %command%

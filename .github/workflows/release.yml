@@ -41,7 +41,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller numpy pillow
+      - run: pip install pyinstaller numpy pillow certifi
       # the DLL goes in compressed: a raw DLL unpacked to %TEMP% by the exe gets blocked by
       # Windows Security as a dropped payload
       - name: Payload and icon
@@ -50,20 +50,35 @@ jobs:
           mkdir -p payload build
           python -c "import sys; sys.path.insert(0, 'installer'); import setup_core as c; c.make_payload('dll/version.dll', 'payload/version.bin')"
           python installer/setup_app.py --write-icon build/icon.ico
+      # PIL._tkinter_finder: ImageTk imports it lazily, without it the window cannot start.
+      # Linux: the build machine's libfontconfig / libfreetype are left out of the bundle so
+      # Tk uses the system's own; an older bundled fontconfig cannot read newer distros'
+      # font configuration (pages of "Fontconfig error" and fallback fonts).
       - name: Build setup program
         shell: bash
-        run: >
-          pyinstaller --onefile ${{ matrix.extra }} --name ${{ matrix.name }}
-          --paths tools --paths installer
-          --add-data "payload/version.bin:payload"
-          --add-data "mod:payload/mod"
-          --add-data "tools:tools"
-          --add-data "installer/logo.png:installer"
-          --hidden-import numpy --hidden-import PIL.Image --hidden-import PIL.ImageFont
-          --hidden-import PIL.ImageDraw --hidden-import PIL.ImageFilter --hidden-import PIL.ImageTk
-          --hidden-import setup_gui --hidden-import skin --hidden-import bcn
-          --hidden-import uisprite --hidden-import pack --hidden-import locate
-          installer/setup_app.py
+        run: |
+          pyi-makespec --onefile ${{ matrix.extra }} --name ${{ matrix.name }} \
+            --paths tools --paths installer \
+            --add-data "payload/version.bin:payload" \
+            --add-data "mod:payload/mod" \
+            --add-data "tools:tools" \
+            --add-data "installer/logo.png:installer" \
+            --hidden-import numpy --hidden-import PIL.Image --hidden-import PIL.ImageFont \
+            --hidden-import PIL.ImageDraw --hidden-import PIL.ImageFilter --hidden-import PIL.ImageTk \
+            --hidden-import PIL._tkinter_finder --hidden-import certifi \
+            --hidden-import setup_gui --hidden-import skin --hidden-import bcn \
+            --hidden-import uisprite --hidden-import pack --hidden-import locate \
+            installer/setup_app.py
+          python - "${{ matrix.name }}.spec" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          drop = ('\na.binaries = [b for b in a.binaries if not __import__("os").path.basename(b[0])'
+                  '.startswith(("libfontconfig.so", "libfreetype.so"))]\n')
+          i = s.index("\npyz = PYZ(")
+          open(p, "w").write(s[:i] + drop + s[i:])
+          EOF
+          pyinstaller "${{ matrix.name }}.spec"
       - name: Package
         shell: bash
         run: |

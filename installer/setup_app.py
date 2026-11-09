@@ -17,31 +17,118 @@ TITLE = "Civ V UI Scale %s Setup" % core.VERSION
 
 
 # ------------------------------------------------------------------ text mode
-def ask(prompt, default=None):
+def _use_color(stream):
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
     try:
-        v = input("%s%s: " % (prompt, " [%s]" % default if default else "")).strip()
+        return stream.isatty()
+    except Exception:
+        return False
+
+
+COLOR = _use_color(sys.stdout)
+if COLOR and sys.platform == "win32":
+    os.system("")  # turns on ANSI escape handling in the Windows console
+
+
+def c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if COLOR else text
+
+
+BOLD, DIM, RED, GREEN, YELLOW, BLUE, CYAN, GOLD = "1", "2", "31", "32", "33", "34", "36", "1;33"
+# kind: (symbol, colour of the symbol, colour of the text)
+KINDS = {
+    "step": ("==>", "1;36", "1"),
+    "info": ("  -", DIM, ""),
+    "ok": ("  \u2713", "1;32", ""),
+    "warn": ("  !", "1;33", "33"),
+    "error": ("  \u2717", "1;31", "31"),
+}
+
+
+def say(msg, kind="info"):
+    sym, sc, tc = KINDS.get(kind, KINDS["info"])
+    if not COLOR and sym.strip() == "\u2713":
+        sym = "  ok"
+    elif not COLOR and sym.strip() == "\u2717":
+        sym = "  !!"
+    lines = str(msg).splitlines() or [""]
+    print("%s %s" % (c(sc, sym), c(tc, lines[0]) if tc else lines[0]))
+    for line in lines[1:]:
+        print("%s %s" % (" " * len(sym), c(tc, line) if tc else line))
+
+
+def ask(prompt, default=None):
+    q = "%s %s%s: " % (c(GOLD, "  ?"), c(BOLD, prompt), c(DIM, " [%s]" % default) if default else "")
+    try:
+        v = input(q).strip()
     except EOFError:
         v = ""
     return v or default
 
 
+class Bar:
+    """One-line progress bar (download in MB, unlock in files)."""
+    WIDTH = 30
+
+    def __init__(self):
+        self.kind = None
+        self.last = -1
+
+    def __call__(self, kind, done, total):
+        if kind != self.kind:
+            self.kind, self.last = kind, -1
+        frac = done / max(total, 1)
+        pct = int(frac * 100)
+        if pct == self.last and done < total:
+            return
+        self.last = pct
+        fill = int(frac * self.WIDTH)
+        bar = c(GREEN, "\u2501" * fill) + c(DIM, "\u2501" * (self.WIDTH - fill))
+        if kind == "download":
+            what = "%6.1f / %.1f MB" % (done / 1e6, total / 1e6)
+        else:
+            what = "%d / %d files" % (done, total)
+        label = {"download": "Downloading", "unlock": "Unlocking  "}.get(kind, kind)
+        if sys.stdout.isatty():
+            print("\r    %s %s %3d%%  %s" % (label, bar, pct, c(DIM, what)), end="", flush=True)
+            if done >= total:
+                print()
+        elif done >= total:
+            print("    %s %s" % (label, what))
+
+
+def banner():
+    title = " Civ V UI Scale %s " % core.VERSION
+    print()
+    print(c(GOLD, "\u2554" + "\u2550" * len(title) + "\u2557"))
+    print(c(GOLD, "\u2551") + c("1;97", title) + c(GOLD, "\u2551"))
+    print(c(GOLD, "\u255a" + "\u2550" * len(title) + "\u255d"))
+    print()
+
+
 def cli(a):
+    banner()
     games = core.locate.find_games(a.game)
     game = a.game or (games[0][0] if games else None)
     if not a.yes:
         if games:
-            print("Found Civilization V:")
+            say("Found Civilization V:", "step")
             for i, (g, _) in enumerate(games):
-                print("  %d) %s" % (i + 1, g))
+                print("    %s %s" % (c(GOLD, "%d)" % (i + 1)), g))
         v = ask("Game folder (number or path)", "1" if games else None)
         if v and v.isdigit() and games and 1 <= int(v) <= len(games):
             game = games[int(v) - 1][0]
         elif v:
             game = os.path.expanduser(v)
     if not game or not core.locate.is_game_dir(game):
-        sys.exit("Civilization V not found. Pass --game \"/path/to/Sid Meier's Civilization V\".")
+        say("Civilization V not found. Pass --game \"/path/to/Sid Meier's Civilization V\".",
+            "error")
+        sys.exit(1)
     if a.uninstall:
-        core.uninstall(game)
+        core.uninstall(game, log=say)
         return
     scale = a.scale or 2
     font = None if a.no_font else (a.font or core.find_font())
@@ -49,15 +136,18 @@ def cli(a):
         if (ask("Use your installed Tw Cen MT (%s)? y/n" % font, "y") or "y").lower() != "y":
             font = None
     elif not font and not a.no_font:
-        print(core.FONT_HINT)
-
-    def progress(kind, d, t):
-        print("\r  %s %d / %d" % (kind, d, t), end="", flush=True)
-        if d >= t:
-            print()
-    notes = core.install(game, scale, font, log=print, progress=progress)
+        say("Tw Cen MT is not installed. " + core.FONT_HINT, "warn")
+    print()
+    notes = core.install(game, scale, font, log=say, progress=Bar())
     for n in notes:
-        print("\n" + n)
+        print()
+        if "WINEDLLOVERRIDES" in n:
+            head, opt = n.split("\n", 1)
+            say("One more step. " + head, "step")
+            print("    " + c("1;97;44", " " + opt.strip() + " "))
+        else:
+            say(n, "warn")
+    print()
 
 
 # ------------------------------------------------------------------ GUI
@@ -157,7 +247,7 @@ def gui():
     logbox = tk.Text(root, height=6, wrap="word", state="disabled")
     logbox.pack(fill="both", expand=True, **pad)
 
-    def log(msg):
+    def log(msg, kind=None):
         def put():
             logbox.config(state="normal")
             logbox.insert("end", msg + "\n")
@@ -237,22 +327,31 @@ def main():
         return setup_gui.write_icon(a.write_icon)
     if a.cli or a.uninstall or (sys.platform != "win32" and not os.environ.get("DISPLAY")
                                 and not os.environ.get("WAYLAND_DISPLAY")):
-        try:
-            return cli(a)
-        except (ValueError, OSError) as e:
-            sys.exit("Error: %s" % e)
+        return run_cli(a)
+    # Civ V styled window (tkinter + Pillow), else the plain Tk window, else text mode
     try:
-        try:
-            import setup_gui  # Civ V styled window (tkinter + Pillow)
-        except ImportError:
-            setup_gui = None
-        if setup_gui:
-            setup_gui.run(a)
-        else:
-            gui()
-    except Exception as e:  # no Tk available: fall back to text mode
-        print("GUI unavailable (%s); using text mode." % e)
+        import setup_gui
+        return setup_gui.run(a)
+    except Exception as e:
+        styled_err = e
+    try:
+        say("Styled window unavailable (%s); using the plain window." % styled_err, "warn")
+        return gui()
+    except Exception as e:
+        say("No window available (%s); using text mode." % e, "warn")
+    run_cli(a)
+
+
+def run_cli(a):
+    try:
         cli(a)
+    except (ValueError, OSError) as e:
+        say("Error: %s" % e, "error")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        say("Cancelled.", "warn")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

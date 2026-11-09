@@ -39,7 +39,7 @@ def xft_dpi():
     try:
         import subprocess
         out = subprocess.run(["xrdb", "-query"], capture_output=True, text=True,
-                             timeout=3).stdout
+                             timeout=3, env=core.host_env()).stdout
         for line in out.splitlines():
             if line.lower().startswith("xft.dpi:"):
                 return float(line.split(":")[1])
@@ -461,7 +461,7 @@ class Setup:
                 self.font_info.set("That file is not Tw Cen MT (regular).", ERR)
 
     # ------------------------------------------------------------ actions
-    def log(self, msg):
+    def log(self, msg, kind=None):
         def put():
             self.log_box.configure(state="normal")
             self.log_box.insert("end", msg + "\n")
