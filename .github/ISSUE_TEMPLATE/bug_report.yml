@@ -1,0 +1,123 @@
+name: Bug report
+description: Something looks wrong or doesn't work with the mod installed
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The log file is the most useful part of a report, so please don't skip it.
+        Before you start, check that you have the [latest release](https://github.com/FabricatedMatter/CivV2k4kMod/releases/latest) installed, because your bug may already be fixed.
+
+  - type: input
+    id: version
+    attributes:
+      label: Mod version
+      description: It's in the installer's title bar and in the first line of the log.
+      placeholder: "0.1.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (Steam Proton)
+        - Steam Deck
+        - Other (say which below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dx
+    attributes:
+      label: Game version started from Steam
+      description: Steam asks which version to start when you click Play. The mod only works with DirectX 11.
+      options:
+        - DirectX 11
+        - DirectX 9
+        - Windows 8 / touch
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: resolution
+    attributes:
+      label: Game resolution and window mode
+      description: As set in the game's Video Options.
+      placeholder: "3840x2160, fullscreen"
+    validations:
+      required: true
+
+  - type: input
+    id: scale
+    attributes:
+      label: UI Scale setting
+      description: The UI Scale chosen in the game's options (or Scale= in UIScale.ini).
+      placeholder: "200 %"
+    validations:
+      required: true
+
+  - type: textarea
+    id: monitors
+    attributes:
+      label: Monitors
+      description: |
+        For each monitor: its resolution and its Windows display scaling (Settings > System > Display > Scale), plus which monitor the game runs on.
+      placeholder: |
+        1: 3840x2160, Windows scaling 150 %, game runs here
+        2: 1920x1080, Windows scaling 100 %
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card
+      placeholder: "NVIDIA GeForce RTX 3070 Ti"
+    validations:
+      required: false
+
+  - type: textarea
+    id: mods
+    attributes:
+      label: Expansions and other mods
+      description: Gods & Kings / Brave New World, and any other mods (especially UI mods such as Enhanced User Interface).
+      placeholder: "Brave New World, Enhanced User Interface"
+    validations:
+      required: false
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, what you expected, and the steps to get there. Add screenshots here (drag them into the box).
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: UIScale.log
+      description: |
+        Close the game first, then drag the file into this box.
+        - **Windows:** `Documents\My Games\Sid Meier's Civilization 5\Logs\UIScale.log`. If you use OneDrive, Documents may be under `OneDrive\Documents`.
+        - **Linux / Steam Deck:** `~/.local/share/Steam/steamapps/compatdata/8930/pfx/drive_c/users/steamuser/Documents/My Games/Sid Meier's Civilization 5/Logs/UIScale.log`
+
+        If there is no UIScale.log, write that here instead. It means the mod did not load at all.
+      placeholder: Drag UIScale.log here
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I tested with the latest release of the mod.
+          required: true
+        - label: I closed the game before attaching the log, so the log is complete.
+          required: true
