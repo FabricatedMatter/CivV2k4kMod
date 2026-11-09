@@ -1,5 +1,7 @@
 # Civ V UI Scale
 
+![Civ V 2k/4k UI Scaling mod](docs/banner.png)
+
 Makes the Civilization V interface crisp and readable at 1440p, 4K and above.
 
 - resolution-independent UI scaling: a **UI Scale** slider in *Options → Interface Options*
