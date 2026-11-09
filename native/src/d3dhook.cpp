@@ -4,11 +4,13 @@
 //     add r0.xy, v_pos.xyxx, -cbN[k].xzxx ; lt r0.xy, r0.xyxx, 0 ; discard_nz ...
 // SV_Position is in real pixels while the engine supplies the rect in UI units,
 // so at scale != 1 everything inside scroll panels / edit boxes is discarded.
-// When such a shader is created we rewrite each clip `add` into
-//     mad r0.xy, (+-)cbN[k], cb13[0].xxxx, (+-)v_pos      (= pos - clip * scale)
-// and bind a tiny constant buffer holding the current scale to slot 13 whenever
-// a patched shader is set. Method tables live in d3d11.dll (DXVK), not in the
-// CEG-protected exe. Prototype + validation: tools/dxbc_clipfix.py.
+// When such a shader is created each clip `add` is kept and followed by
+//     mad r0.xy, (+-)cbN[k], cb13[0].xxxx, r0.xyzw       (= pos - clip * scale)
+// with cb13[0] = scale - 1, a tiny constant buffer bound to slot 13 whenever a
+// patched shader is set. Holding scale - 1 makes the patch fail safe: if the buffer
+// is ever not bound (cb13 reads 0) clipping is exactly the game's own, instead of
+// every clipped pixel being discarded. Method tables live in d3d11.dll (DXVK), not
+// in the CEG-protected exe. Prototype + validation: tools/dxbc_clipfix.py.
 #include <d3d11.h>
 #include <windows.h>
 
@@ -190,13 +192,22 @@ bool PatchClipShader(const void* bc, SIZE_T len, std::vector<uint8_t>& out, int*
           if (types[j] == 1 && idxs[j] == posReg) posI = j;
           if (types[j] == 8) cbI = j;
         }
-        if (posI > 0 && cbI > 0) {
-          uint32_t bodyLen = lens[0] + lens[cbI] + 3 + lens[posI];
+        // dst: a plain temp register with a write mask (no saturate, no extended token)
+        uint32_t d0 = starts[0][0];
+        bool dstOk = types[0] == 0 && lens[0] == 2 && !(d0 & 0x80000000u) &&
+                     ((d0 >> 2) & 3) == 0 && (d0 & 3) == 2 && !(p[0] & (1u << 13));
+        if (posI > 0 && cbI > 0 && dstOk) {
+          // add dst, pos, -clip   (unchanged)
+          // mad dst, -clip, cb13[0].x, dst.xyzw   -> pos - clip * (1 + (scale - 1))
+          o.insert(o.end(), p, p + l);
+          uint32_t srcTok = (d0 & ~0xFFCu) | (1u << 2) | (0xE4u << 4);  // .xyzw swizzle
+          uint32_t bodyLen = lens[0] + lens[cbI] + 3 + lens[0];
           o.push_back((p[0] & ~0x7F0007FFu) | kOpMad | ((1 + bodyLen) << 24));
           o.insert(o.end(), starts[0], starts[0] + lens[0]);
           o.insert(o.end(), starts[cbI], starts[cbI] + lens[cbI]);
           o.insert(o.end(), kScaleOperand, kScaleOperand + 3);
-          o.insert(o.end(), starts[posI], starts[posI] + lens[posI]);
+          o.push_back(srcTok);
+          o.insert(o.end(), starts[0] + 1, starts[0] + lens[0]);
           ++*changed;
           continue;
         }
@@ -975,14 +986,29 @@ HRESULT STDMETHODCALLTYPE HookCreateTex2D(ID3D11Device* dev, const D3D11_TEXTURE
   return g_origCreateTex2D(dev, d, init, out);
 }
 
+// Context method tables hooked (one hook instance per table). DXVK has one table for
+// immediate and one for deferred contexts; Microsoft's runtime may use others for the
+// game's own device than for the helper device, so there is room for more.
+// Microsoft's d3d11 gives every context its own table (the game creates 8 deferred contexts
+// besides the immediate one), so there must be room for many.
+constexpr int kCtxSlots = 32;
+#define SLOTS8_(F, b)                                                                    \
+  (void*)&F<b + 0>, (void*)&F<b + 1>, (void*)&F<b + 2>, (void*)&F<b + 3>, (void*)&F<b + 4>, \
+      (void*)&F<b + 5>, (void*)&F<b + 6>, (void*)&F<b + 7>
+#define PICK_SLOT(F)                                                                     \
+  ([](int s) -> void* {                                                                  \
+    static void* const t[kCtxSlots] = {SLOTS8_(F, 0), SLOTS8_(F, 8), SLOTS8_(F, 16),     \
+                                       SLOTS8_(F, 24)};                                  \
+    return t[s];                                                                         \
+  }(slot))
 constexpr int kVtCreatePS = 15;    // ID3D11Device::CreatePixelShader
 constexpr int kVtPSSetShader = 9;  // ID3D11DeviceContext::PSSetShader
 constexpr int kVtPSSetCB = 16;     // ID3D11DeviceContext::PSSetConstantBuffers
 
 CreatePSFn g_origCreatePS = nullptr;
-PSSetShaderFn g_origPSSetShader[2] = {};
-PSSetCBFn g_PSSetCB[2] = {};
-void** g_ctxVt[2] = {};
+PSSetShaderFn g_origPSSetShader[kCtxSlots] = {};
+PSSetCBFn g_PSSetCB[kCtxSlots] = {};
+void** g_ctxVt[kCtxSlots] = {};
 CreateWindowExAFn g_origCreateWindowExA = nullptr;
 
 CRITICAL_SECTION g_cs;
@@ -993,15 +1019,34 @@ std::unordered_set<void*> g_uiPS;
 // PSSetShader was seen here, and whether that shader is a UI shader.
 thread_local ID3D11DeviceContext* t_smCtx = nullptr;
 thread_local bool t_smUI = false;
-ID3D11Buffer* volatile g_scaleBuf = nullptr;
-volatile float g_bufScale = -1.0f;
+thread_local bool t_clip = false;  // ... and whether that shader is clip-patched
+// Clip-scale binding statistics per context method table (logged by ClipStats).
+volatile LONG g_stClipSet[kCtxSlots] = {}, g_stClipDraw[kCtxSlots] = {};
+volatile LONG g_stCbOverwrite = 0, g_stDrawRebind = 0;
+// Clip-scale buffer per device: a buffer belongs to the device that created it (Microsoft's
+// d3d11 is strict about that, DXVK is not), so each device gets its own.
+struct ScaleBuf {
+  float scale;
+  ID3D11Buffer* buf;
+};
+std::unordered_map<ID3D11Device*, ScaleBuf> g_scaleBufs;
 int g_patchedCount = 0;
+// Every pixel shader created through our CreatePixelShader hook (diagnostics: shaders set
+// that were created some other way were never looked at for clip code).
+std::unordered_set<void*> g_allPS;
+volatile LONG g_stUnknownPS = 0, g_stBindMismatch = 0;
+volatile LONG g_stRestored = 0;  // hook entries found overwritten by d3d11 and restored
 
 ID3D11Buffer* ScaleBuffer(ID3D11Device* dev) {
   float s = EffectiveScale();
   EnterCriticalSection(&g_cs);
-  if (!g_scaleBuf || g_bufScale != s) {
-    float data[4] = {s, s, s, s};
+  ScaleBuf& sb = g_scaleBufs[dev];
+  if (!sb.buf || sb.scale != s) {
+    if (!sb.buf && g_scaleBufs.size() > 1)
+      Log("clip scale: device %p is the %u. device drawing clipped UI, own buffer", (void*)dev,
+          (unsigned)g_scaleBufs.size());
+    float k = s - 1.0f;  // see the patch: cb13 holds scale - 1 (0 = the game's own clipping)
+    float data[4] = {k, k, k, k};
     D3D11_BUFFER_DESC d = {};
     d.ByteWidth = 16;
     d.Usage = D3D11_USAGE_IMMUTABLE;
@@ -1011,19 +1056,20 @@ ID3D11Buffer* ScaleBuffer(ID3D11Device* dev) {
     if (SUCCEEDED(dev->CreateBuffer(&d, &init, &buf))) {
       // The previous buffer may still be referenced by recorded command lists;
       // scale changes are rare, so it is intentionally kept alive.
-      g_scaleBuf = buf;
-      g_bufScale = s;
+      sb.buf = buf;
+      sb.scale = s;
     }
   }
-  ID3D11Buffer* r = g_scaleBuf;
+  ID3D11Buffer* r = sb.buf;
   LeaveCriticalSection(&g_cs);
   return r;
 }
 
 HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device*, const void*, SIZE_T,
                                             ID3D11ClassLinkage*, ID3D11PixelShader**);
+void HookGameContexts(ID3D11Device* dev);
 std::unordered_map<void*, std::vector<uint8_t>> g_psCode;  // diagnostics: PS -> bytecode
-void* g_curPS[2] = {};
+void* g_curPS[kCtxSlots] = {};
 std::unordered_set<void*> g_psDumped;
 std::unordered_set<void*> g_spritePS;  // pixel shaders with the tile-sprite patch
 
@@ -1053,7 +1099,13 @@ void RememberPS(ID3D11PixelShader** out, const void* bc, SIZE_T len) {
 
 HRESULT STDMETHODCALLTYPE HookCreatePS(ID3D11Device* dev, const void* bc, SIZE_T len,
                                        ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
+  HookGameContexts(dev);
   HRESULT hr0 = HookCreatePSInner(dev, bc, len, link, out);
+  if (SUCCEEDED(hr0) && out && *out) {
+    EnterCriticalSection(&g_cs);
+    g_allPS.insert(*out);
+    LeaveCriticalSection(&g_cs);
+  }
   if (SUCCEEDED(hr0)) RememberPS(out, bc, len);
   return hr0;
 }
@@ -1122,29 +1174,107 @@ HRESULT STDMETHODCALLTYPE HookCreatePSInner(ID3D11Device* dev, const void* bc, S
   return hr;
 }
 
+// The current clip-scale buffer (created / replaced when the scale changes).
+ID3D11Buffer* CurrentScaleBuffer(ID3D11DeviceContext* ctx) {
+  ID3D11Device* dev = nullptr;
+  ctx->GetDevice(&dev);
+  ID3D11Buffer* buf = dev ? ScaleBuffer(dev) : nullptr;
+  if (dev) dev->Release();
+  return buf;
+}
+
+template <int W>
+ID3D11Buffer* BindScale(ID3D11DeviceContext* ctx) {
+  if (g_cfg.testUnboundClip) {
+    static bool logged = false;
+    if (!logged) Log("TestUnboundClipScale: clip-scale buffer not bound");
+    logged = true;
+    return nullptr;
+  }
+  ID3D11Buffer* buf = CurrentScaleBuffer(ctx);
+  if (buf) g_PSSetCB[W](ctx, kScaleSlot, 1, &buf);
+  return buf;
+}
+
+void RestoreContextHooks(int slot, void** vt, const char* where);
+void** CtxSlotTable(int slot);
+
 template <int W>
 void STDMETHODCALLTYPE HookPSSetShader(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                                        ID3D11ClassInstance* const* ci, UINT n) {
   g_origPSSetShader[W](ctx, ps, ci, n);
+  // the draw entries this context's draws go through may have been swapped back by d3d11
+  void** vt = *reinterpret_cast<void***>(ctx);
+  if (vt == CtxSlotTable(W)) RestoreContextHooks(W, vt, "at PSSetShader");
   g_curPS[W] = ps;
   t_smCtx = ctx;
   t_smUI = false;
+  t_clip = false;
   if (!ps) return;
   EnterCriticalSection(&g_cs);
   bool ours = g_patched.count(ps) != 0;
   t_smUI = g_uiPS.count(ps) != 0;
+  bool known = g_allPS.count(ps) != 0;
   LeaveCriticalSection(&g_cs);
+  if (!known && InterlockedIncrement(&g_stUnknownPS) <= 8)
+    Log("PSSetShader: pixel shader %p was not created through the hook (ctx %p, slot %d) - "
+        "its clip code was never patched", (void*)ps, (void*)ctx, W);
   if (!ours) return;
-  ID3D11Buffer* buf = g_scaleBuf;
-  if (!buf || g_bufScale != EffectiveScale()) {
-    ID3D11Device* dev = nullptr;
-    ctx->GetDevice(&dev);
-    if (dev) {
-      buf = ScaleBuffer(dev);
-      dev->Release();
-    }
+  t_clip = true;
+  ++g_stClipSet[W];
+  ID3D11Buffer* want = BindScale<W>(ctx);
+  if (g_cfg.testUnboundClip) return;
+  // did the binding take?
+  ID3D11Buffer* bound = nullptr;
+  ctx->PSGetConstantBuffers(kScaleSlot, 1, &bound);
+  if (bound != want && InterlockedIncrement(&g_stBindMismatch) <= 5)
+    Log("clip scale: slot 13 holds %p right after binding %p (ctx %p, slot %d)", (void*)bound,
+        (void*)want, (void*)ctx, W);
+  if (bound) bound->Release();
+  static std::unordered_set<void*>* seen = new std::unordered_set<void*>;
+  static LONG seenLock = 0;
+  if (seen->size() < 8 && !InterlockedExchange(&seenLock, 1)) {
+    if (seen->insert(ctx).second)
+      Log("clip shaders set on context %p (table %p, slot %d, table at ctx%+d)", (void*)ctx,
+          (void*)vt, W, (int)((char*)vt - (char*)ctx));
+    InterlockedExchange(&seenLock, 0);
   }
-  if (buf) g_PSSetCB[W](ctx, kScaleSlot, 1, &buf);
+}
+
+// The game rebinding a range of constant-buffer slots that includes 13 (e.g. clearing all
+// 14) drops the clip scale while a patched shader stays bound: bind it again.
+template <int W>
+void STDMETHODCALLTYPE HookPSSetCB(ID3D11DeviceContext* ctx, UINT start, UINT n,
+                                   ID3D11Buffer* const* bufs) {
+  g_PSSetCB[W](ctx, start, n, bufs);
+  if (start <= kScaleSlot && kScaleSlot < start + n && g_patchedCount > 0) {
+    if (InterlockedIncrement(&g_stCbOverwrite) <= 3)
+      Log("clip scale: the game rebinds PS constant buffers %u-%u (ctx %p)", start,
+          start + n - 1, (void*)ctx);
+    if (t_smCtx == ctx && t_clip) BindScale<W>(ctx);
+  }
+}
+
+void ClipStats();
+
+// Draw-time check for clip-patched shaders: the scale must be in slot 13 now, whatever
+// happened since PSSetShader (state cleared, command lists, other rebinding).
+template <int W>
+void CheckClipDraw(ID3D11DeviceContext* ctx) {
+  if (!(t_smCtx == ctx && t_clip) || g_cfg.testUnboundClip) return;
+  ++g_stClipDraw[W];
+  ID3D11Buffer* bound = nullptr;
+  ctx->PSGetConstantBuffers(kScaleSlot, 1, &bound);
+  ID3D11Buffer* want = CurrentScaleBuffer(ctx);
+  if (bound != want && want) {
+    LONG k = InterlockedIncrement(&g_stDrawRebind);
+    if (k <= 5)
+      Log("clip scale: missing at draw (slot 13 = %p, ctx %p, table slot %d), rebound",
+          (void*)bound, (void*)ctx, W);
+    g_PSSetCB[W](ctx, kScaleSlot, 1, &want);
+  }
+  if (bound) bound->Release();
+  ClipStats();
 }
 
 void PatchVt(void** vt, int idx, void* fn, void** orig) {
@@ -1158,15 +1288,15 @@ void PatchVt(void** vt, int idx, void* fn, void** orig) {
 constexpr int kVtPSSetSRV = 8;  // ID3D11DeviceContext::PSSetShaderResources
 using PSSetSRVFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
                                              ID3D11ShaderResourceView* const*);
-PSSetSRVFn g_origPSSetSRV[2] = {};
+PSSetSRVFn g_origPSSetSRV[kCtxSlots] = {};
 
-const std::wstring* g_boundArt[2][8] = {};
+const std::wstring* g_boundArt[kCtxSlots][8] = {};
 std::unordered_set<std::wstring> g_drawLogged;
 constexpr int kVtDrawIndexed = 12, kVtDraw = 13;
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
-DrawIndexedFn g_origDrawIndexed[2] = {};
-DrawFn g_origDraw[2] = {};
+DrawIndexedFn g_origDrawIndexed[kCtxSlots] = {};
+DrawFn g_origDraw[kCtxSlots] = {};
 
 void DumpPSCode(void* ps, const wchar_t* tag);
 
@@ -1183,7 +1313,7 @@ bool ArtTraced(const std::wstring& name) {
   return false;
 }
 
-UINT g_ovlRTSize[2] = {};  // overlay diagnostics: size of the bound overlay page (0 = none)
+UINT g_ovlRTSize[kCtxSlots] = {};  // overlay diagnostics: size of the bound overlay page (0 = none)
 std::unordered_set<void*> g_ovlPSLogged;
 // ------------------------------------------------- smooth fractional scaling
 // The UI samples with nearest filtering. At integer scales the k x art maps texel per
@@ -1247,8 +1377,8 @@ constexpr int kVtDrawIndexedInstanced = 20, kVtDrawInstanced = 21;
 using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT,
                                                         INT, UINT);
 using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
-DrawIndexedInstancedFn g_origDrawIndexedInst[2] = {};
-DrawInstancedFn g_origDrawInst[2] = {};
+DrawIndexedInstancedFn g_origDrawIndexedInst[kCtxSlots] = {};
+DrawInstancedFn g_origDrawInst[kCtxSlots] = {};
 bool g_smoothDraws = false;  // set when the draw hooks are installed for smooth scaling
 
 // Full-screen backgrounds: the engine's loading pictures (Loading_<n>.dds,
@@ -1374,24 +1504,28 @@ void NoteDraw() {
 template <int S>
 void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* c, UINT n, UINT i0, INT b) {
   if (g_cfg.dumpTextures) NoteDraw<S>();
+  CheckClipDraw<S>(c);
   SmoothDraw sm(c);
   g_origDrawIndexed[S](c, n, i0, b);
 }
 template <int S>
 void STDMETHODCALLTYPE HookDraw(ID3D11DeviceContext* c, UINT n, UINT v0) {
   if (g_cfg.dumpTextures) NoteDraw<S>();
+  CheckClipDraw<S>(c);
   SmoothDraw sm(c);
   g_origDraw[S](c, n, v0);
 }
 template <int S>
 void STDMETHODCALLTYPE HookDrawIndexedInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT i0,
                                            INT b, UINT s0) {
+  CheckClipDraw<S>(c);
   SmoothDraw sm(c);
   g_origDrawIndexedInst[S](c, n, inst, i0, b, s0);
 }
 template <int S>
 void STDMETHODCALLTYPE HookDrawInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT v0,
                                     UINT s0) {
+  CheckClipDraw<S>(c);
   SmoothDraw sm(c);
   g_origDrawInst[S](c, n, inst, v0, s0);
 }
@@ -1474,14 +1608,20 @@ using OMSetRTFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
                                             ID3D11DepthStencilView*);
 using RSSetVPFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
 using RSSetSciFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_RECT*);
-OMSetRTFn g_origOMSetRT[2] = {};
-RSSetVPFn g_origRSSetVP[2] = {};
-RSSetSciFn g_origRSSetSci[2] = {};
-float g_rtScale[2] = {1.0f, 1.0f};
-D3D11_VIEWPORT g_lastVP[2][4];
-UINT g_lastVPn[2] = {};
-D3D11_RECT g_lastSci[2][4];
-UINT g_lastScin[2] = {};
+OMSetRTFn g_origOMSetRT[kCtxSlots] = {};
+RSSetVPFn g_origRSSetVP[kCtxSlots] = {};
+RSSetSciFn g_origRSSetSci[kCtxSlots] = {};
+struct RtScales {
+  float v[kCtxSlots];
+  RtScales() {
+    for (float& f : v) f = 1.0f;
+  }
+  float& operator[](int i) { return v[i]; }
+} g_rtScale;
+D3D11_VIEWPORT g_lastVP[kCtxSlots][4];
+UINT g_lastVPn[kCtxSlots] = {};
+D3D11_RECT g_lastSci[kCtxSlots][4];
+UINT g_lastScin[kCtxSlots] = {};
 int g_vpScaledLogged = 0;
 
 template <int S>
@@ -1612,9 +1752,9 @@ using CopySubRegionFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Res
                                                   const D3D11_BOX*);
 using CopyResourceFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
                                                  ID3D11Resource*);
-CopySubRegionFn g_origCopySub[2] = {};
-CopyResourceFn g_origCopyRes[2] = {};
-OMSetRTFn g_origOMSetRTDiag[2] = {};
+CopySubRegionFn g_origCopySub[kCtxSlots] = {};
+CopyResourceFn g_origCopyRes[kCtxSlots] = {};
+OMSetRTFn g_origOMSetRTDiag[kCtxSlots] = {};
 int g_ovDiag = 0;
 
 bool DescOf(ID3D11Resource* r, D3D11_TEXTURE2D_DESC* d) {
@@ -1700,55 +1840,265 @@ void STDMETHODCALLTYPE DiagOMSetRT(ID3D11DeviceContext* c, UINT n,
   }
   g_origOMSetRTDiag[S](c, n, rtv, dsv);
 }
-void HookContextVt(ID3D11DeviceContext* ctx) {
-  void** vt = *reinterpret_cast<void***>(ctx);
-  if (g_ctxVt[0] == vt || g_ctxVt[1] == vt) return;
-  int slot = g_ctxVt[0] ? 1 : 0;
-  if (g_ctxVt[slot]) return;
-  g_ctxVt[slot] = vt;
-  g_PSSetCB[slot] = reinterpret_cast<PSSetCBFn>(vt[kVtPSSetCB]);
-  PatchVt(vt, kVtPSSetShader,
-          slot == 0 ? (void*)&HookPSSetShader<0> : (void*)&HookPSSetShader<1>,
-          reinterpret_cast<void**>(&g_origPSSetShader[slot]));
+// Periodic summary (at most every 20 s, only when something changed, bounded).
+void ClipStats() {
+  static DWORD last = 0;
+  static LONG lastSum = -1;
+  static int lines = 0;
+  DWORD now = GetTickCount();
+  if (lines >= 40 || now - last < 20000) return;
+  last = now;
+  LONG sum = g_stCbOverwrite + g_stDrawRebind + g_stRestored + g_stUnknownPS + g_stBindMismatch;
+  char sets[512] = "", draws[512] = "";
+  int used = kCtxSlots;
+  while (used > 1 && !g_ctxVt[used - 1] && !g_stClipSet[used - 1] && !g_stClipDraw[used - 1])
+    --used;
+  for (int i = 0; i < used; ++i) {
+    sum += g_stClipSet[i] + g_stClipDraw[i];
+    size_t a = strlen(sets), b = strlen(draws);
+    snprintf(sets + a, sizeof sets - a, " %ld", (long)g_stClipSet[i]);
+    snprintf(draws + b, sizeof draws - b, " %ld", (long)g_stClipDraw[i]);
+  }
+  if (sum == lastSum) return;
+  lastSum = sum;
+  ++lines;
+  Log("clip stats per table slot: set [%s ] draws [%s ]  game rebinds 13: %ld  rebound at draw: "
+      "%ld  hooks restored: %ld  unhooked PS set: %ld  bind mismatch: %ld",
+      sets, draws, (long)g_stCbOverwrite, (long)g_stDrawRebind, (long)g_stRestored,
+      (long)g_stUnknownPS, (long)g_stBindMismatch);
+}
+
+bool HookContextVt(ID3D11DeviceContext* ctx, const char* what);
+CRITICAL_SECTION g_hookCs;
+
+// Deferred contexts the game creates itself: hook their tables too.
+constexpr int kVtCreateDeferredContext = 27;  // ID3D11Device::CreateDeferredContext
+using CreateDeferredFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT,
+                                                      ID3D11DeviceContext**);
+CreateDeferredFn g_origCreateDeferred = nullptr;
+thread_local bool t_inOwnCreateDeferred = false;
+HRESULT STDMETHODCALLTYPE HookCreateDeferred(ID3D11Device* dev, UINT flags,
+                                             ID3D11DeviceContext** out) {
+  HRESULT hr = g_origCreateDeferred(dev, flags, out);
+  if (SUCCEEDED(hr) && out && *out && !t_inOwnCreateDeferred) {
+    static int n = 0;
+    void** vt = *reinterpret_cast<void***>(*out);
+    if (++n <= 8) Log("game created deferred context %p (table %p)", (void*)*out, (void*)vt);
+    EnterCriticalSection(&g_hookCs);
+    HookContextVt(*out, "deferred context created by the game");
+    LeaveCriticalSection(&g_hookCs);
+  }
+  return hr;
+}
+
+// Points vt[idx] at fn unless it already does; the entry it replaces becomes *orig.
+// Re-applying is therefore harmless, and it has to be done: Microsoft's d3d11 keeps each
+// context's method table inside the context object (no table shared between contexts or
+// devices) and rewrites entries while the game runs - the four draw entries flip between
+// two implementations after flushes, and every entry changes when multithread protection
+// is switched. DXVK's tables are static and never change.
+int HookEntry(void** vt, int idx, void* fn, void** orig, uint32_t* mask) {
+  if (vt[idx] == fn) return 0;
+  PatchVt(vt, idx, fn, orig);
+  if (idx < 64) mask[idx / 32] |= 1u << (idx % 32);
+  return 1;
+}
+
+// (Re)installs every hook of a slot on table vt. Returns the number of entries written;
+// mask (2 words, method indices < 64) says which. Caller holds g_hookCs.
+int ApplyContextHooks(int slot, void** vt, uint32_t mask[2]) {
+  int n = 0;
+  if (IsActive())
+    n += HookEntry(vt, kVtPSSetCB, PICK_SLOT(HookPSSetCB),
+                   reinterpret_cast<void**>(&g_PSSetCB[slot]), mask);
+  else
+    g_PSSetCB[slot] = reinterpret_cast<PSSetCBFn>(vt[kVtPSSetCB]);
+  n += HookEntry(vt, kVtPSSetShader, PICK_SLOT(HookPSSetShader),
+                 reinterpret_cast<void**>(&g_origPSSetShader[slot]), mask);
   if (g_cfg.overlayScale) {
-    PatchVt(vt, kVtOMSetRT, slot == 0 ? (void*)&HookOMSetRT<0> : (void*)&HookOMSetRT<1>,
-            reinterpret_cast<void**>(&g_origOMSetRT[slot]));
-    PatchVt(vt, kVtRSSetViewports, slot == 0 ? (void*)&HookRSSetVP<0> : (void*)&HookRSSetVP<1>,
-            reinterpret_cast<void**>(&g_origRSSetVP[slot]));
-    PatchVt(vt, kVtRSSetScissor, slot == 0 ? (void*)&HookRSSetSci<0> : (void*)&HookRSSetSci<1>,
-            reinterpret_cast<void**>(&g_origRSSetSci[slot]));
+    n += HookEntry(vt, kVtOMSetRT, PICK_SLOT(HookOMSetRT),
+                   reinterpret_cast<void**>(&g_origOMSetRT[slot]), mask);
+    n += HookEntry(vt, kVtRSSetViewports, PICK_SLOT(HookRSSetVP),
+                   reinterpret_cast<void**>(&g_origRSSetVP[slot]), mask);
+    n += HookEntry(vt, kVtRSSetScissor, PICK_SLOT(HookRSSetSci),
+                   reinterpret_cast<void**>(&g_origRSSetSci[slot]), mask);
   }
   if (g_cfg.overlayDiag) {
-    PatchVt(vt, kVtCopySubRegion, slot == 0 ? (void*)&DiagCopySub<0> : (void*)&DiagCopySub<1>,
-            reinterpret_cast<void**>(&g_origCopySub[slot]));
-    PatchVt(vt, kVtCopyResource, slot == 0 ? (void*)&DiagCopyRes<0> : (void*)&DiagCopyRes<1>,
-            reinterpret_cast<void**>(&g_origCopyRes[slot]));
+    n += HookEntry(vt, kVtCopySubRegion, PICK_SLOT(DiagCopySub),
+                   reinterpret_cast<void**>(&g_origCopySub[slot]), mask);
+    n += HookEntry(vt, kVtCopyResource, PICK_SLOT(DiagCopyRes),
+                   reinterpret_cast<void**>(&g_origCopyRes[slot]), mask);
     if (!g_cfg.overlayScale)
-      PatchVt(vt, kVtOMSetRT, slot == 0 ? (void*)&DiagOMSetRT<0> : (void*)&DiagOMSetRT<1>,
-              reinterpret_cast<void**>(&g_origOMSetRTDiag[slot]));
+      n += HookEntry(vt, kVtOMSetRT, PICK_SLOT(DiagOMSetRT),
+                     reinterpret_cast<void**>(&g_origOMSetRTDiag[slot]), mask);
   }
   bool smooth = g_cfg.smoothScaling && (!g_art.empty() || !g_fontPages.empty());
   bool cover = g_cfg.backgroundCover && !g_cfg.vanilla && IsActive();
-  if (g_cfg.dumpTextures) {
-    PatchVt(vt, kVtPSSetSRV, slot == 0 ? (void*)&HookPSSetSRV<0> : (void*)&HookPSSetSRV<1>,
-            reinterpret_cast<void**>(&g_origPSSetSRV[slot]));
-  }
-  if (g_cfg.dumpTextures || smooth || cover) {
+  if (g_cfg.dumpTextures)
+    n += HookEntry(vt, kVtPSSetSRV, PICK_SLOT(HookPSSetSRV),
+                   reinterpret_cast<void**>(&g_origPSSetSRV[slot]), mask);
+  bool clipCheck = IsActive();  // CheckClipDraw
+  if (g_cfg.dumpTextures || smooth || cover || clipCheck) {
     if (smooth) g_smoothDraws = true;
     if (cover) g_coverDraws = true;
-    PatchVt(vt, kVtDrawIndexed,
-            slot == 0 ? (void*)&HookDrawIndexed<0> : (void*)&HookDrawIndexed<1>,
-            reinterpret_cast<void**>(&g_origDrawIndexed[slot]));
-    PatchVt(vt, kVtDraw, slot == 0 ? (void*)&HookDraw<0> : (void*)&HookDraw<1>,
-            reinterpret_cast<void**>(&g_origDraw[slot]));
+    n += HookEntry(vt, kVtDrawIndexed, PICK_SLOT(HookDrawIndexed),
+                   reinterpret_cast<void**>(&g_origDrawIndexed[slot]), mask);
+    n += HookEntry(vt, kVtDraw, PICK_SLOT(HookDraw), reinterpret_cast<void**>(&g_origDraw[slot]),
+                   mask);
   }
-  if (smooth || cover) {
-    PatchVt(vt, kVtDrawIndexedInstanced,
-            slot == 0 ? (void*)&HookDrawIndexedInst<0> : (void*)&HookDrawIndexedInst<1>,
-            reinterpret_cast<void**>(&g_origDrawIndexedInst[slot]));
-    PatchVt(vt, kVtDrawInstanced,
-            slot == 0 ? (void*)&HookDrawInst<0> : (void*)&HookDrawInst<1>,
-            reinterpret_cast<void**>(&g_origDrawInst[slot]));
+  if (smooth || cover || clipCheck) {
+    n += HookEntry(vt, kVtDrawIndexedInstanced, PICK_SLOT(HookDrawIndexedInst),
+                   reinterpret_cast<void**>(&g_origDrawIndexedInst[slot]), mask);
+    n += HookEntry(vt, kVtDrawInstanced, PICK_SLOT(HookDrawInst),
+                   reinterpret_cast<void**>(&g_origDrawInst[slot]), mask);
+  }
+  return n;
+}
+
+void** CtxSlotTable(int slot) { return g_ctxVt[slot]; }
+
+// Restores hooks the runtime overwrote on slot's table. Cheap when nothing changed.
+void RestoreContextHooks(int slot, void** vt, const char* where) {
+  // quick unlocked check of the two entries the clip scale depends on + one draw entry
+  if (vt[kVtPSSetShader] == PICK_SLOT(HookPSSetShader) &&
+      (!IsActive() || vt[kVtPSSetCB] == PICK_SLOT(HookPSSetCB)) &&
+      (!IsActive() || (vt[kVtDraw] == PICK_SLOT(HookDraw) &&
+                       vt[kVtDrawIndexed] == PICK_SLOT(HookDrawIndexed))))
+    return;
+  EnterCriticalSection(&g_hookCs);
+  uint32_t mask[2] = {};
+  int n = g_ctxVt[slot] == vt ? ApplyContextHooks(slot, vt, mask) : 0;
+  LeaveCriticalSection(&g_hookCs);
+  if (n) {
+    LONG k = InterlockedIncrement(&g_stRestored);
+    if (k <= 12)
+      Log("context method table %p (slot %d): %d hook entries overwritten by d3d11, restored "
+          "(%s; methods 0x%08x%08x)", (void*)vt, slot, n, where, mask[1], mask[0]);
+  }
+}
+
+// Log lines about hooking tables (bounded: contexts may come and go all session).
+int g_hookLogs = 0;
+bool HookLogOk() { return ++g_hookLogs <= 40; }
+
+// Returns false if all slots are taken (the table is then left alone). Caller holds g_hookCs.
+bool HookContextVt(ID3D11DeviceContext* ctx, const char* what) {
+  void** vt = *reinterpret_cast<void***>(ctx);
+  int slot = -1, freeSlot = -1;
+  for (int i = 0; i < kCtxSlots && slot < 0; ++i) {
+    if (g_ctxVt[i] == vt) slot = i;
+    else if (!g_ctxVt[i] && freeSlot < 0) freeSlot = i;
+  }
+  bool known = slot >= 0;
+  if (!known) slot = freeSlot;
+  if (slot < 0) {
+    static int n = 0;
+    if (++n <= 5)
+      Log("context method table %p (%s) NOT hooked: all %d slots in use", (void*)vt, what,
+          kCtxSlots);
+    return false;
+  }
+  g_ctxVt[slot] = vt;
+  // A known table can still need hooks: with Microsoft's d3d11 a new context can be
+  // allocated where a released one (e.g. the helper device's) was, with a fresh table.
+  uint32_t mask[2] = {};
+  int n = ApplyContextHooks(slot, vt, mask);
+  if (!known && HookLogOk())
+    Log("context method table %p hooked (%s, slot %d, table at ctx%+d)", (void*)vt, what, slot,
+        (int)((char*)vt - (char*)ctx));
+  else if (known && n && HookLogOk())
+    Log("context method table %p (%s, slot %d) re-hooked: %d entries were not ours", (void*)vt,
+        what, slot, n);
+  return true;
+}
+
+// A context we created only to find its table is about to be released. With Microsoft's
+// d3d11 the table lives inside the context object and dies with it, so its slot is freed
+// (DXVK's tables are static and shared: kept). Caller holds g_hookCs.
+void ForgetContextTable(ID3D11DeviceContext* ctx) {
+  void** vt = *reinterpret_cast<void***>(ctx);
+  if ((char*)vt < (char*)ctx || (char*)vt >= (char*)ctx + 64) return;
+  for (int i = 0; i < kCtxSlots; ++i)
+    if (g_ctxVt[i] == vt) g_ctxVt[i] = nullptr;
+}
+
+// The contexts of the device the game actually renders with. The tables hooked from the
+// helper device are not necessarily the game's (Microsoft's d3d11.dll can use different
+// ones per device); an unhooked table means the clip scale is never bound. Called from
+// CreatePixelShader, i.e. with the game's device, once per device.
+// g_hookCs: own lock; device calls are made while holding it (never call back into our hooks).
+void* volatile g_lastGameDev = nullptr;
+// The game's immediate context (one reference kept, so it can be checked every frame).
+ID3D11DeviceContext* volatile g_gameImm = nullptr;
+
+void HookGameContexts(ID3D11Device* dev) {
+  if (!dev || dev == g_lastGameDev) return;
+  EnterCriticalSection(&g_hookCs);
+  if (dev != g_lastGameDev) {
+    g_lastGameDev = dev;
+    ID3D11DeviceContext* imm = nullptr;
+    dev->GetImmediateContext(&imm);
+    if (imm) {
+      HookContextVt(imm, "game device, immediate");
+      ID3D11DeviceContext* old = g_gameImm;
+      g_gameImm = imm;  // keeps the reference
+      if (old) old->Release();
+    }
+    ID3D11DeviceContext* def = nullptr;
+    t_inOwnCreateDeferred = true;
+    HRESULT dhr = dev->CreateDeferredContext(0, &def);
+    t_inOwnCreateDeferred = false;
+    void** dvt = *reinterpret_cast<void***>(dev);
+    if (dvt[kVtCreatePS] != (void*)&HookCreatePS)
+      Log("game device method table %p differs from the hooked one", (void*)dvt);
+    if (dvt[kVtCreateDeferredContext] != (void*)&HookCreateDeferred && g_origCreateDeferred)
+      Log("game device: CreateDeferredContext not hooked");
+    if (SUCCEEDED(dhr) && def) {
+      HookContextVt(def, "game device, deferred");
+      ForgetContextTable(def);
+      def->Release();
+    }
+  }
+  LeaveCriticalSection(&g_hookCs);
+}
+
+// Device method entries hooked (CreatePixelShader, CreateDeferredContext): restored if
+// overwritten. With Microsoft's d3d11 the device table is shared by all devices.
+void** volatile g_devVt = nullptr;
+
+// Once per frame (PeekMessageW): the hooks the clip scale depends on must still be in the
+// game's immediate context table, and that context must still use a hooked table.
+void VerifyHooksNow() {
+  ID3D11DeviceContext* imm = g_gameImm;
+  if (imm) {
+    void** vt = *reinterpret_cast<void***>(imm);
+    int slot = 0;
+    while (slot < kCtxSlots && g_ctxVt[slot] != vt) ++slot;
+    static void** failed = nullptr;  // no free slot for it: do not retry every frame
+    if (slot == kCtxSlots && vt != failed) {
+      static int n = 0;
+      if (++n <= 4) Log("game immediate context %p uses unhooked table %p: hooking it",
+                        (void*)imm, (void*)vt);
+      EnterCriticalSection(&g_hookCs);
+      if (!HookContextVt(imm, "game device, immediate")) failed = vt;
+      LeaveCriticalSection(&g_hookCs);
+    } else if (slot < kCtxSlots) {
+      RestoreContextHooks(slot, vt, "per frame");
+    }
+  }
+  void** dvt = g_devVt;
+  if (dvt && (dvt[kVtCreatePS] != (void*)&HookCreatePS ||
+              (g_origCreateDeferred && dvt[kVtCreateDeferredContext] != (void*)&HookCreateDeferred))) {
+    EnterCriticalSection(&g_hookCs);
+    uint32_t mask[2] = {};
+    int n = HookEntry(dvt, kVtCreatePS, (void*)&HookCreatePS,
+                      reinterpret_cast<void**>(&g_origCreatePS), mask);
+    if (g_origCreateDeferred)
+      n += HookEntry(dvt, kVtCreateDeferredContext, (void*)&HookCreateDeferred,
+                     reinterpret_cast<void**>(&g_origCreateDeferred), mask);
+    LeaveCriticalSection(&g_hookCs);
+    static int k = 0;
+    if (n && ++k <= 6) Log("device method table %p: %d hook entries overwritten, restored", (void*)dvt, n);
   }
 }
 
@@ -1766,6 +2116,9 @@ void HookFromDevice(ID3D11Device* dev, ID3D11DeviceContext* imm, const char* how
   g_d3dOk = true;
   PatchVt(*reinterpret_cast<void***>(dev), kVtCreatePS, (void*)&HookCreatePS,
           reinterpret_cast<void**>(&g_origCreatePS));
+  PatchVt(*reinterpret_cast<void***>(dev), kVtCreateDeferredContext, (void*)&HookCreateDeferred,
+          reinterpret_cast<void**>(&g_origCreateDeferred));
+  g_devVt = *reinterpret_cast<void***>(dev);
   float s = ConfiguredScale();
   if (g_cfg.aiArt && s >= 1.25f) {
     if (s > 2.5f) LoadArtManifest(L"x3");
@@ -1781,14 +2134,21 @@ void HookFromDevice(ID3D11Device* dev, ID3D11DeviceContext* imm, const char* how
   if (!g_art.empty() || !g_fontPages.empty() || g_cfg.dumpTextures || g_cfg.overlayScale)
     PatchVt(*reinterpret_cast<void***>(dev), kVtCreateTex2D, (void*)&HookCreateTex2D,
             reinterpret_cast<void**>(&g_origCreateTex2D));
-  if (imm) HookContextVt(imm);
+  EnterCriticalSection(&g_hookCs);
+  if (imm) HookContextVt(imm, "immediate");
   ID3D11DeviceContext* def = nullptr;
-  if (SUCCEEDED(dev->CreateDeferredContext(0, &def)) && def) {
-    HookContextVt(def);
+  t_inOwnCreateDeferred = true;
+  HRESULT dhr = dev->CreateDeferredContext(0, &def);
+  t_inOwnCreateDeferred = false;
+  if (SUCCEEDED(dhr) && def) {
+    HookContextVt(def, "deferred");
+    ForgetContextTable(def);
     def->Release();
   }
-  Log("D3D11 hooks installed via %s (CreatePixelShader, PSSetShader x%d)", how,
-      g_ctxVt[1] ? 2 : 1);
+  LeaveCriticalSection(&g_hookCs);
+  int nvt = 0;
+  for (int i = 0; i < kCtxSlots; ++i) nvt += g_ctxVt[i] != nullptr;
+  Log("D3D11 hooks installed via %s (CreatePixelShader, PSSetShader x%d)", how, nvt);
 }
 
 // Primary path: the game's own D3D11CreateDevice (import table of the exe).
@@ -1843,7 +2203,12 @@ void HookD3DVtables(int attempts) {
     return;
   }
   HookFromDevice(dev, imm, "a helper device");
-  if (imm) imm->Release();
+  if (imm) {
+    EnterCriticalSection(&g_hookCs);
+    ForgetContextTable(imm);  // dies with the helper device on Microsoft's d3d11
+    LeaveCriticalSection(&g_hookCs);
+    imm->Release();
+  }
   dev->Release();
 }
 
@@ -1858,6 +2223,7 @@ HWND WINAPI HookCreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, 
 
 void InstallD3DHooks() {
   InitializeCriticalSection(&g_cs);
+  InitializeCriticalSection(&g_hookCs);
   g_origCreateWindowExA = reinterpret_cast<CreateWindowExAFn>(PatchIAT(
       GetModuleHandleW(nullptr), "USER32.dll", "CreateWindowExA", (void*)&HookCreateWindowExA));
   Log("CreateWindowExA hook %s", g_origCreateWindowExA ? "ok" : "FAILED");
@@ -1877,4 +2243,11 @@ void EnsureD3DHooks() {
 }
 
 bool D3DHooksReady() { return g_d3dOk; }
+
+void VerifyD3DHooks() {
+  if (IsActive() && g_vtHooked) {
+    VerifyHooksNow();
+    ClipStats();  // the draw hooks are not reliable on every runtime: also log from here
+  }
+}
 }  // namespace uis

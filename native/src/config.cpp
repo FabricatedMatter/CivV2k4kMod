@@ -46,6 +46,7 @@ void LoadConfig() {
   g_cfg.patchOptionsMenu = ReadFloat(L"PatchOptionsMenu", 1.0f) != 0.0f;
   g_cfg.failWarning = ReadFloat(L"FailWarning", 1.0f) != 0.0f;
   g_cfg.testSafeMode = ReadFloat(L"TestSafeMode", 0.0f) != 0.0f;
+  g_cfg.testUnboundClip = ReadFloat(L"TestUnboundClipScale", 0.0f) != 0.0f;
   g_cfg.overlayScale = (int)ReadFloat(L"OverlayScale", 0.0f);
   if (g_cfg.overlayScale < 2 || g_cfg.overlayScale > 4) g_cfg.overlayScale = 0;
   // The fix uses a hardware breakpoint (debug register). On Windows the game's Steam DRM

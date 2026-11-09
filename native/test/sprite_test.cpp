@@ -8,6 +8,7 @@ float EffectiveScale() { return 2.0f; }
 void Log(const char*, ...) {}
 void* PatchIAT(HMODULE, const char*, const char*, void*) { return nullptr; }
 float ConfiguredScale() { return 2.0f; }
+void GetVirtualSize(int* w, int* h) { *w = 1920; *h = 1080; }
 Config g_cfg;
 std::wstring g_modDir;
 }

@@ -4,8 +4,10 @@
 Civ V's UI pixel shaders discard pixels outside a clip rect:
     add r0.xy, v_pos.xyxx, -cbN[k].xzxx ; lt ... ; discard_nz
 SV_Position is in real pixels, the clip rect in UI units. Each such
-`add` becomes `mad r, (+-)cb, cb13[0].xxxx, (+-)v_pos` = pos - clip*scale,
-which has the same sign as pos/scale - clip.
+`add r, (+-)v_pos, (-+)cb` is kept and followed by
+`mad r, (-+)cb, cb13[0].xxxx, r.xyzw` with cb13 = scale - 1, giving
+pos - clip*scale (same sign as pos/scale - clip). An unbound cb13 reads 0,
+which leaves the game's own clipping intact.
 
 usage: dxbc_clipfix.py IN.dxbc OUT.dxbc
 """
@@ -131,8 +133,13 @@ def patch(blob):
             srcs = {(ty, idx): o for o, ty, idx in (a, b)}
             pos = next((o for o, ty, idx in (a, b) if ty == 1 and idx == pos_reg), None)
             cb = next((o for o, ty, idx in (a, b) if ty == 8), None)
-            if pos is not None and cb is not None:
-                body = dst[0] + cb + SCALE_OPERAND + pos
+            d0 = dst[0][0]
+            dst_ok = (dst[1] == 0 and len(dst[0]) == 2 and not d0 & 0x80000000
+                      and (d0 >> 2) & 3 == 0 and d0 & 3 == 2 and not ins[0] & (1 << 13))
+            if pos is not None and cb is not None and dst_ok:
+                out += ins
+                src = (d0 & ~0xFFC) | (1 << 2) | (0xE4 << 4)  # dst as .xyzw source
+                body = dst[0] + cb + SCALE_OPERAND + [src] + dst[0][1:]
                 out.append((ins[0] & ~0x7F0007FF) | OP_MAD | ((1 + len(body)) << 24))
                 out += body
                 changed += 1

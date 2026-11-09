@@ -24,6 +24,7 @@
 
 namespace uis {
 void HookD3DVtablesOnce();
+void VerifyD3DHooks();
 void EnsureD3DHooks();
 bool D3DHooksReady();
 
@@ -291,6 +292,7 @@ BOOL WINAPI HookPeekMessageW(LPMSG msg, HWND hwnd, UINT fmin, UINT fmax, UINT re
   if (g_active) {
     TracePos("frame", 0, 0);
     HookD3DVtablesOnce();
+    VerifyD3DHooks();
   }  // change since the last message => not message-driven
   if (g_mouseLock) EnforceMouseLock();
   BOOL r = g_origPeek(msg, hwnd, fmin, fmax, remove);

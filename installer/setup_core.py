@@ -37,7 +37,7 @@ PACK_NAME = "civ5-uiscale-art-x%d.pack"
 
 
 # ------------------------------------------------------------------ payload
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 DLL_BLOB = "version.bin"   # the DLL zlib-compressed: no raw DLL is ever unpacked to %TEMP%
 
 

@@ -20,6 +20,7 @@ struct Config {
   bool patchOptionsMenu = true;
   bool failWarning = true;  // message box when falling back to safe mode
   bool testSafeMode = false;  // simulate a hook failure (to test the safe mode)
+  bool testUnboundClip = false;  // never bind the clip-scale buffer (as if a context were unhooked)
   // Experimental: render the map overlay pages (borders, fog) at N x resolution.
   int overlayScale = 0;
   bool overlayDiag = false;  // DumpTextures=3: log overlay page usage
