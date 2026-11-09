@@ -6,6 +6,7 @@ On Windows the window is borderless and shaped by that frame.
 """
 import os
 import sys
+import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog
@@ -118,6 +119,10 @@ class Setup:
         self.view = None
         self._before_log = "form"
         self.images = []   # keep PhotoImages alive
+        # Tk may only be touched from the main thread: the install worker hands UI updates
+        # over through this queue (calling root.after from the worker makes Tcl panic)
+        self._ui_q = queue.Queue()
+        root.after(40, self._pump_ui)
 
         self.W, self.H = round(W_UNITS * s), round(H_UNITS * s)
         self.canvas = c = tk.Canvas(root, width=self.W, height=self.H, highlightthickness=0,
@@ -131,6 +136,21 @@ class Setup:
             root.after(400, self.do_install)
 
     # ------------------------------------------------------------ helpers
+    def ui(self, fn):
+        """Runs fn on the Tk main thread (safe to call from any thread)."""
+        self._ui_q.put(fn)
+
+    def _pump_ui(self):
+        try:
+            for _ in range(200):
+                self._ui_q.get_nowait()()
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(40, self._pump_ui)
+        except tk.TclError:   # window closed
+            pass
+
     def u(self, v):
         return round(v * self.s)
 
@@ -397,7 +417,7 @@ class Setup:
         text, color = {
             "none": ("Civilization V found. Ready to install.", OK),
             "ours": ("Installed. Install again to update or change options.", OK),
-            "foreign": ("Another version.dll is in the game folder (a different mod?). "
+            "foreign": ("Another %s is in the game folder (a different mod?). " % core.DLL_NAME +
                         "Remove it first.", ERR)}[st]
         self.set_game_status(text, color)
         return st != "foreign"
@@ -451,7 +471,7 @@ class Setup:
             if self.busy and line:
                 self._meter_label = line.rstrip(" .")
                 self.set_meter(self._meter_frac, self._meter_label)
-        self.root.after(0, put)
+        self.ui(put)
 
     def set_meter(self, frac, label=""):
         c = self.canvas
@@ -475,7 +495,15 @@ class Setup:
     def progress(self, kind, done, total):
         verb = {"download": "Downloading art", "unlock": "Unlocking hi-res art"}.get(kind, kind)
         frac = done / max(total, 1)
-        self.root.after(0, lambda: self.set_meter(frac, "%s  %d%%" % (verb, frac * 100)))
+        # called once per file: only the newest value is drawn
+        pending = getattr(self, "_progress_pending", None)
+        self._progress_pending = (frac, "%s  %d%%" % (verb, frac * 100))
+        if pending is None:
+            def draw():
+                v, self._progress_pending = self._progress_pending, None
+                if v:
+                    self.set_meter(*v)
+            self.ui(draw)
 
     def set_busy(self, busy):
         self.busy = busy
@@ -494,13 +522,13 @@ class Setup:
         def work():
             try:
                 notes = task() or []
-                self.root.after(0, lambda: self.finish(done_head, notes, None))
+                self.ui(lambda: self.finish(done_head, notes, None))
             except core.NeedsAdmin:
-                self.root.after(0, self.elevate)
+                self.ui(self.elevate)
             except Exception as e:
                 err = str(e) or e.__class__.__name__
                 self.log("Error: " + err)
-                self.root.after(0, lambda: self.finish(None, [], err))
+                self.ui(lambda: self.finish(None, [], err))
         threading.Thread(target=work, daemon=True).start()
 
     def finish(self, head, notes, err):

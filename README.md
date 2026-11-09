@@ -18,10 +18,15 @@ this to the base game's menu).
 **Windows:** download `CivVUIScale-Setup.exe` from the latest release and run it. It fetches
 the art pack (`civ5-uiscale-art-x2.pack`) itself, or uses one placed next to it.
 
-Windows Security may flag the mod's `version.dll`. That is a false alarm: the mod loads into
+On Windows the mod is installed as `msimg32.dll` next to the game exe (on Linux it is
+`version.dll`, see below). Windows Security may flag it. That is a false alarm: the mod loads into
 the game through a proxy DLL, the same way some malware does, and the DLL is not code-signed.
 If the installer reports that it was blocked, open *Windows Security → Virus & threat protection
-→ Protection history*, choose *Allow on device* for `version.dll`, and click Install again.
+→ Protection history*, choose *Allow on device* for `msimg32.dll`, and click Install again.
+
+On Windows the strategic-view icon alignment fix is off by default: it uses a hardware
+breakpoint, and the game's Steam DRM crashes the game when it finds one. Under Linux / Proton it
+is on. (`StrategicViewFix` in `UIScale.ini`.)
 
 **Linux:** download `civ5-uiscale-setup-linux.tar.gz`, unpack it and run `./install.sh`.
 Then set the Steam launch options of Civilization V to
@@ -54,7 +59,11 @@ interface at its normal size for that session and shows a warning instead of a b
 
 ## How it works
 
-A `version.dll` proxy hooks the game without modifying any game code or files:
+A proxy DLL hooks the game without modifying any game code or files. On Linux it is
+`version.dll` (loaded via `WINEDLLOVERRIDES`); on Windows it is `msimg32.dll`, because Windows
+always runs Civ V with compatibility shims (`apphelp` + `AcGenral.dll`) that load the system
+`version.dll` before the game's own imports, so a `version.dll` proxy never loads there. The
+same DLL exports both sets of functions and forwards them to the system DLLs.
 
 - the UI is laid out at a virtual resolution (real / scale) and drawn at the real one
 - mouse input is scaled to match
@@ -64,7 +73,8 @@ A `version.dll` proxy hooks the game without modifying any game code or files:
   `My Games\...\UIScale\cache` and served the same way
 - hi-res UI textures replace the originals on upload, matched by content hash; the tile-sprite
   shader is patched so larger sprite atlases are sampled at full resolution
-- strategic-view icons are realigned via a hardware breakpoint
+- strategic-view icons are realigned via a hardware breakpoint (Linux / Proton only by default:
+  on Windows the game's DRM rejects debug registers)
 
 Only the Steam DX11 build is supported; on an unknown exe the mod logs it and stays inactive.
 
@@ -74,7 +84,7 @@ Requirements: `mingw-w64-gcc`, Python 3 with NumPy, Pillow (+ SciPy for the art 
 the AI-upscaled art `realesrgan-ncnn-vulkan` / `realcugan-ncnn-vulkan` in `build/upscaler/`.
 
 ```
-make -C native                                   # version.dll
+make -C native                                   # version.dll (installed as msimg32.dll on Windows)
 ./install.sh [--ttf "Tw Cen MT.ttf"]             # developer install into the game folder
 ```
 

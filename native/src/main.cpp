@@ -46,6 +46,15 @@ static void Init() {
   CreateDirectoryW((g_userDir + L"\\Logs").c_str(), nullptr);
   LogInit(g_userDir + L"\\Logs\\UIScale.log");
   Log("Civ V UI Scale " UISCALE_VER_STR " loaded into %ls", exeName.c_str());
+  {
+    wchar_t self[MAX_PATH] = L"?";
+    HMODULE me = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&ExeDir, &me);
+    if (me) GetModuleFileNameW(me, self, MAX_PATH);
+    Log("mod DLL: %ls", self);
+  }
 
   InstallCrashLogger();
   LoadConfig();
@@ -73,14 +82,31 @@ static void Init() {
   }
   if (core) InstallD3DHooks();
   if (core && g_cfg.strategicViewFix) InstallStrategicFix(GetCurrentThreadId());  // DllMain runs on the main thread
+  else if (core) Log("strategic view anchor fix off (StrategicViewFix=1 enables it; on Windows the "
+                     "game's DRM rejects its debug register)");
 }
+
+// The same DLL may sit in the game folder under two names (version.dll from an older or a
+// Linux install, msimg32.dll on Windows). Only the first copy loaded into the process hooks
+// the game; any other one just forwards its exports.
+static bool FirstCopyInProcess() {
+  wchar_t name[64];
+  _snwprintf(name, 64, L"Local\\CivVUIScale.%lu", GetCurrentProcessId());
+  name[63] = 0;
+  HANDLE m = CreateMutexW(nullptr, FALSE, name);  // kept open for the process lifetime
+  return m && GetLastError() != ERROR_ALREADY_EXISTS;
+}
+
+static bool g_active = false;
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_DETACH) {
-    Log("process detach");
+    if (g_active) Log("process detach");
   } else if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(inst);
     if (!LoadRealVersionDll()) return FALSE;
+    if (!FirstCopyInProcess()) return TRUE;
+    g_active = true;
     Init();
   }
   return TRUE;

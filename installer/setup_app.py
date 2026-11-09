@@ -69,6 +69,24 @@ def gui():
     root.title(TITLE)
     root.minsize(640, 600)
     pad = {"padx": 10, "pady": 4}
+    # Tk may only be touched from the main thread: the worker hands UI updates over here
+    import queue
+    ui_q = queue.Queue()
+
+    def ui(fn):
+        ui_q.put(fn)
+
+    def pump():
+        try:
+            for _ in range(200):
+                ui_q.get_nowait()()
+        except queue.Empty:
+            pass
+        try:
+            root.after(40, pump)
+        except tk.TclError:
+            pass
+    root.after(40, pump)
 
     games = core.locate.find_games()
     game_var = tk.StringVar(value=games[0][0] if games else "")
@@ -145,10 +163,10 @@ def gui():
             logbox.insert("end", msg + "\n")
             logbox.see("end")
             logbox.config(state="disabled")
-        root.after(0, put)
+        ui(put)
 
     def progress(kind, d, t):
-        root.after(0, lambda: bar.config(maximum=max(t, 1), value=d))
+        ui(lambda: bar.config(maximum=max(t, 1), value=d))
 
     def check_game(*_):
         g = game_var.get()
@@ -158,7 +176,7 @@ def gui():
         st = core.dll_state(g)
         game_status.config(text={"none": "Ready to install.",
                                  "ours": "Installed. Install again to update or change options.",
-                                 "foreign": "Another version.dll is present (a different mod?). "
+                                 "foreign": "Another %s is present (a different mod?). " % core.DLL_NAME +
                                             "Remove it first."}[st])
         return st != "foreign"
     game_var.trace_add("write", check_game)
@@ -174,13 +192,13 @@ def gui():
                 for n in notes:
                     log("\n" + n)
                 if notes and sys.platform != "win32":
-                    root.after(0, lambda: messagebox.showinfo(TITLE, "\n\n".join(notes)))
+                    ui(lambda: messagebox.showinfo(TITLE, "\n\n".join(notes)))
             except Exception as e:
                 log("Error: %s" % e)
-                root.after(0, lambda m=str(e): messagebox.showerror(TITLE, m))
+                ui(lambda m=str(e): messagebox.showerror(TITLE, m))
             finally:
-                root.after(0, lambda: [b.state(["!disabled"]) for b in btns.winfo_children()])
-                root.after(0, check_game)
+                ui(lambda: [b.state(["!disabled"]) for b in btns.winfo_children()])
+                ui(check_game)
         threading.Thread(target=work, daemon=True).start()
 
     def do_install():

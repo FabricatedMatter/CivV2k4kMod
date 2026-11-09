@@ -13,6 +13,11 @@ std::wstring g_modDir;
 
 static std::wstring IniPath() { return g_userDir + L"\\UIScale.ini"; }
 
+bool UnderWine() {
+  HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+  return nt && GetProcAddress(nt, "wine_get_version");
+}
+
 static float ReadFloat(const wchar_t* key, float def) {
   wchar_t buf[64];
   wchar_t defs[64];
@@ -43,7 +48,10 @@ void LoadConfig() {
   g_cfg.testSafeMode = ReadFloat(L"TestSafeMode", 0.0f) != 0.0f;
   g_cfg.overlayScale = (int)ReadFloat(L"OverlayScale", 0.0f);
   if (g_cfg.overlayScale < 2 || g_cfg.overlayScale > 4) g_cfg.overlayScale = 0;
-  g_cfg.strategicViewFix = ReadFloat(L"StrategicViewFix", 1.0f) != 0.0f;
+  // The fix uses a hardware breakpoint (debug register). On Windows the game's Steam DRM
+  // (CEG) detects debug registers and crashes the game on purpose about 15 s after start,
+  // so it is only on by default under Wine / Proton, where that check does not trigger.
+  g_cfg.strategicViewFix = ReadFloat(L"StrategicViewFix", UnderWine() ? 1.0f : 0.0f) != 0.0f;
   g_cfg.shots = ReadString(L"Shots");
   g_cfg.artTrace = ReadString(L"ArtTrace");
   g_cfg.sampleBias = ReadFloat(L"SampleBias", 1.0f) != 0.0f;
@@ -54,6 +62,7 @@ void LoadConfig() {
   g_cfg.shotLook = ReadString(L"ShotLook");
   g_cfg.shotMouse = ReadString(L"ShotMouse");
   g_cfg.vanilla = ReadFloat(L"Vanilla", 0.0f) != 0.0f;
+  g_cfg.traceFiles = ReadFloat(L"TraceFiles", 0.0f) != 0.0f;
   if (g_cfg.vanilla) {
     g_cfg.scale = 1.0f;
     g_cfg.crispFonts = false;

@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "config.h"
 #include "hook.h"
 #include "log.h"
 
@@ -113,21 +114,44 @@ bool IsRead(DWORD access, DWORD disp) {
          (disp == OPEN_EXISTING || disp == OPEN_ALWAYS);
 }
 
+int g_traceLeft = 4000;
+void Trace(const char* what, const wchar_t* name, const std::wstring* to, bool ok) {
+  if (!g_cfg.traceFiles || g_traceLeft <= 0) return;
+  if (ok && !to) return;  // only failures and redirects
+  DWORD e = GetLastError();
+  --g_traceLeft;
+  Log("trace %s %ls%ls%ls -> %s (err %lu)", what, name ? name : L"(null)", to ? L" => " : L"",
+      to ? to->c_str() : L"", ok ? "ok" : "FAIL", ok ? 0ul : e);
+  SetLastError(e);
+}
+
 HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                               DWORD disp, DWORD flags, HANDLE tmpl) {
-  if (IsRead(access, disp))
-    if (auto o = Lookup(name)) return g_origCreateFileW(o->c_str(), access, share, sa, disp, flags, tmpl);
-  return g_origCreateFileW(name, access, share, sa, disp, flags, tmpl);
+  const std::wstring* o = IsRead(access, disp) ? Lookup(name) : nullptr;
+  HANDLE h = g_origCreateFileW(o ? o->c_str() : name, access, share, sa, disp, flags, tmpl);
+  if (g_cfg.traceFiles && (flags & FILE_FLAG_BACKUP_SEMANTICS) && g_traceLeft > 0) {
+    DWORD e = GetLastError();
+    --g_traceLeft;
+    Log("trace dir-open %ls -> %s", name ? name : L"(null)", h != INVALID_HANDLE_VALUE ? "ok" : "FAIL");
+    SetLastError(e);
+  }
+  Trace("CreateFileW", name, o, h != INVALID_HANDLE_VALUE);
+  return h;
 }
 
 HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                               DWORD disp, DWORD flags, HANDLE tmpl) {
+  std::wstring w = Widen(name);
   if (name && IsRead(access, disp)) {
-    std::wstring w = Widen(name);
-    if (auto o = Lookup(w.c_str()))
-      return CreateFileW(o->c_str(), access, share, sa, disp, flags, tmpl);
+    if (auto o = Lookup(w.c_str())) {
+      HANDLE h = CreateFileW(o->c_str(), access, share, sa, disp, flags, tmpl);
+      Trace("CreateFileA", w.c_str(), o, h != INVALID_HANDLE_VALUE);
+      return h;
+    }
   }
-  return g_origCreateFileA(name, access, share, sa, disp, flags, tmpl);
+  HANDLE h = g_origCreateFileA(name, access, share, sa, disp, flags, tmpl);
+  Trace("CreateFileA", w.c_str(), nullptr, h != INVALID_HANDLE_VALUE);
+  return h;
 }
 
 BOOL WINAPI HookGetAttrExW(LPCWSTR name, GET_FILEEX_INFO_LEVELS lvl, LPVOID info) {
@@ -206,6 +230,13 @@ template <typename FD, typename FirstFn, typename FillFn>
 HANDLE FindFirstCommon(const std::wstring& pattern, FD* fd, FirstFn first, FillFn fill) {
   std::vector<Extra> extra = ExtrasFor(pattern);
   HANDLE h = first();
+  if (g_cfg.traceFiles && g_traceLeft > 0) {
+    DWORD e = GetLastError();
+    --g_traceLeft;
+    Log("trace FindFirst %ls -> %s, %u extra", pattern.c_str(),
+        h == INVALID_HANDLE_VALUE ? "none" : "found", (unsigned)extra.size());
+    SetLastError(e);
+  }
   if (extra.empty()) return h;
   auto* s = new Search{h, std::move(extra), 0};
   if (h == INVALID_HANDLE_VALUE) {  // no real match: serve the extras from a fake handle
@@ -337,6 +368,11 @@ bool InstallFileRedirect(const std::wstring& gameDir, const std::vector<std::wst
     Hook(exe, "FindClose", &HookFindClose, &g_origFindClose);
   }
   Log("file redirect hooks installed");
+  if (g_cfg.traceFiles) {
+    wchar_t cwd[MAX_PATH] = L"?";
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    Log("trace cwd at startup: %ls", cwd);
+  }
   return g_origCreateFileW || g_origCreateFileA;
 }
 }  // namespace uis

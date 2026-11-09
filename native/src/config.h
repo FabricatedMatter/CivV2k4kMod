@@ -10,7 +10,8 @@ struct Config {
   float maxScale = 4.0f;
   bool crispFonts = true;
   bool aiArt = true;  // AI-upscaled UI textures (tools/uiart.py)
-  // Align world anchors in strategic view (costs some FPS in that view only).
+  // Align world anchors in strategic view (costs some FPS in that view only). Default on
+  // under Wine / Proton only: on Windows the game's DRM crashes on the debug register.
   bool strategicViewFix = true;
   bool logMouse = false;
   bool dumpTextures = false;  // UI art diagnostics (1: also dump uploads to UIScale/dump)
@@ -36,6 +37,7 @@ struct Config {
   // like the unmodded game (scale 1, original art, fonts and borders), so the same driver
   // can take the "before" shots.
   bool vanilla = false;
+  bool traceFiles = false;  // TraceFiles=1: log failed file opens and redirects
   std::wstring shots;       // Shots=<run name>: run tools/shots.py's driver (empty = off)
   std::wstring shotSave;    // ShotSave=<save file name or path>
   std::wstring shotScales;  // ShotScales=0,1.5,2 (0 = auto)
@@ -51,4 +53,5 @@ void LoadConfig();
 void SaveConfig();
 // Shots= is still set in UIScale.ini (tools/shots.py removes it when it stops)
 bool ShotsStillRequested();
+bool UnderWine();  // running under Wine / Proton
 }  // namespace uis

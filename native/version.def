@@ -17,3 +17,8 @@ EXPORTS
   VerLanguageNameW = proxy_VerLanguageNameW
   VerQueryValueA = proxy_VerQueryValueA
   VerQueryValueW = proxy_VerQueryValueW
+  AlphaBlend = proxy_AlphaBlend
+  DllInitialize = proxy_DllInitialize
+  GradientFill = proxy_GradientFill
+  TransparentBlt = proxy_TransparentBlt
+  vSetDdrawflag = proxy_vSetDdrawflag

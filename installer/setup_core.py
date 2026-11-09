@@ -1,7 +1,9 @@
 """Civ V UI Scale installer logic (shared by the Windows .exe and the Linux installer).
 
 Installs into the game folder, adding files only:
-    version.dll                      the mod (refuses to replace a foreign version.dll)
+    msimg32.dll (Windows)            the mod (refuses to replace a foreign DLL); Windows
+    version.dll (Linux / Proton)     applies compatibility shims to Civ V that preload the
+                                     system version.dll, so there the mod uses msimg32.dll
     UIScale/Override/...             the UI Scale options (the DLL patches them into the
                                      options menu at startup, also EUI's)
     UIScale/UIArt/x<k>/              hi-res UI art, unlocked from the art pack with the
@@ -22,18 +24,25 @@ sys.path.insert(0, os.path.join(BUNDLE, "tools"))
 import locate  # noqa: E402
 import pack  # noqa: E402
 
-MARKER = b"Civ V UI Scale"          # string inside our version.dll
+MARKER = b"Civ V UI Scale"          # string inside our DLL
+# File name of the mod DLL in the game folder. On Windows the game always runs with
+# compatibility shims (apphelp + AcGenral.dll) that load the system version.dll before the
+# exe's imports are resolved, so a version.dll proxy is never used there; msimg32.dll is
+# imported by the exe and not preloaded. Wine has no such shims and is told to use the
+# native version.dll via WINEDLLOVERRIDES, so Linux keeps that name.
+DLL_NAME = "msimg32.dll" if sys.platform == "win32" else "version.dll"
+OTHER_DLL_NAMES = [n for n in ("version.dll", "msimg32.dll") if n != DLL_NAME]
 RELEASE_URL = "https://github.com/FabricatedMatter/CivV2k4kMod/releases/latest/download/"
 PACK_NAME = "civ5-uiscale-art-x%d.pack"
 
 
 # ------------------------------------------------------------------ payload
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DLL_BLOB = "version.bin"   # the DLL zlib-compressed: no raw DLL is ever unpacked to %TEMP%
 
 
 def payload_dll():
-    """Bytes of the mod's version.dll."""
+    """Bytes of the mod DLL (built as version.dll, installed as DLL_NAME)."""
     import zlib
     p = os.path.join(BUNDLE, "payload", DLL_BLOB)
     if os.path.isfile(p):
@@ -68,9 +77,9 @@ def installer_dir():
 
 
 # ------------------------------------------------------------------ status
-def dll_state(game):
-    """'none', 'ours' or 'foreign' for the version.dll in the game folder."""
-    p = os.path.join(game, "version.dll")
+def dll_state(game, name=None):
+    """'none', 'ours' or 'foreign' for the mod DLL (DLL_NAME) in the game folder."""
+    p = os.path.join(game, name or DLL_NAME)
     if not os.path.exists(p):
         return "none"
     try:
@@ -145,10 +154,10 @@ class NeedsAdmin(Exception):
     """The game folder is write-protected; the installer has to run as administrator."""
 
 
-AV_BLOCKED = ("Windows Security blocked version.dll. This is a false alarm: the mod loads "
+AV_BLOCKED = ("Windows Security blocked %s. This is a false alarm: the mod loads "
               "into the game the same way some malware does, so the unsigned DLL gets flagged. "
               "Open Windows Security > Virus & threat protection > Protection history, "
-              "choose Allow on device for version.dll, then click Install again.")
+              "choose Allow on device for %s, then click Install again." % (DLL_NAME, DLL_NAME))
 
 
 def is_admin():
@@ -198,7 +207,7 @@ def open_protection_history():
 def write_dll(game):
     """Copies the mod DLL into the game folder and checks it arrived intact."""
     data = payload_dll()
-    dst = os.path.join(game, "version.dll")
+    dst = os.path.join(game, DLL_NAME)
     try:
         with open(dst, "wb") as f:
             f.write(data)
@@ -217,7 +226,19 @@ def write_dll(game):
         raise
     if not ok:
         raise ValueError(AV_BLOCKED if sys.platform == "win32" else
-                         "version.dll could not be written completely: " + dst)
+                         "%s could not be written completely: %s" % (DLL_NAME, dst))
+
+
+def remove_other_dlls(game, log):
+    """Removes our DLL under the name the other platform uses (an older Windows install
+    used version.dll, which never loads there)."""
+    for n in OTHER_DLL_NAMES:
+        if dll_state(game, n) == "ours":
+            try:
+                os.remove(os.path.join(game, n))
+                log("Removed the old %s (the mod now uses %s)" % (n, DLL_NAME))
+            except OSError as e:
+                log("Could not remove the old %s: %s" % (n, e))
 
 
 def find_pack(scale, log, progress):
@@ -258,13 +279,14 @@ def install(game, scale, use_font=None, art=True, log=print, progress=lambda *a:
         raise ValueError("Not a Civilization V folder (CivilizationV_DX11.exe missing): " + game)
     state = dll_state(game)
     if state == "foreign":
-        raise ValueError("A different version.dll is already in the game folder. "
-                         "Remove it first (another mod?) and run the installer again.")
+        raise ValueError("A different %s is already in the game folder. "
+                         "Remove it first (another mod?) and run the installer again." % DLL_NAME)
     if sys.platform == "win32" and not can_write(game):
         raise NeedsAdmin(game)
     dst = os.path.join(game, "UIScale")
     log("Installing to %s" % game)
     write_dll(game)
+    remove_other_dlls(game, log)
     # fresh mod files, keep nothing stale from older versions
     for sub in ("Override", "UIArt", "Fonts"):
         shutil.rmtree(os.path.join(dst, sub), ignore_errors=True)
@@ -319,12 +341,13 @@ def render_fonts(game, dst, scale, ttf, log):
 def uninstall(game, log=print):
     if sys.platform == "win32" and not can_write(game):
         raise NeedsAdmin(game)
-    state = dll_state(game)
-    if state == "ours":
-        os.remove(os.path.join(game, "version.dll"))
-        log("Removed version.dll")
-    elif state == "foreign":
-        log("Left version.dll alone (it is not ours).")
+    for n in [DLL_NAME] + OTHER_DLL_NAMES:
+        state = dll_state(game, n)
+        if state == "ours":
+            os.remove(os.path.join(game, n))
+            log("Removed %s" % n)
+        elif state == "foreign" and n == DLL_NAME:
+            log("Left %s alone (it is not ours)." % n)
     shutil.rmtree(os.path.join(game, "UIScale"), ignore_errors=True)
     log("Removed UIScale/. Uninstalled.")
     if sys.platform != "win32":
