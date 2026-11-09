@@ -66,7 +66,7 @@ This is not the same as AI-generating textures, rather all the textures are the 
 Unfortunately this means I cant distribute them freely as, say, png files, since I dont wanna step on any toes.
 Instead, the textures are distributed as encrypted .pack files you can only decrypt if you have a legitimate copy of the game and thus have all the textures in non-upscaled form on you PC.
 
-### Turning off AI art and where to find the log
+### Turning off upscaled art and where to find the log
 Settings: `My Games/Sid Meier's Civilization 5/UIScale.ini` · Log: `Logs/UIScale.log`
 (`AIArt=0` disables the art). If the mod cannot attach to the game's graphics it keeps the
 interface at its normal size for that session and shows a warning instead of a broken UI.
