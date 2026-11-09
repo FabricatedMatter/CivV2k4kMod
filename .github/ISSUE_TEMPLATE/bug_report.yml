@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! The log file is the most useful part of a report, so please don't skip it.
+        Thanks for reporting! Only a few fields are required. The log file is the most useful part, because it tells me most of the rest.
         Before you start, check that you have the [latest release](https://github.com/FabricatedMatter/CivV2k4kMod/releases/latest) installed, because your bug may already be fixed.
 
   - type: input
@@ -41,7 +41,7 @@ body:
         - Windows 8 / touch
         - Not sure
     validations:
-      required: true
+      required: false
 
   - type: input
     id: resolution
@@ -50,7 +50,7 @@ body:
       description: As set in the game's Video Options.
       placeholder: "3840x2160, fullscreen"
     validations:
-      required: true
+      required: false
 
   - type: input
     id: scale
@@ -59,7 +59,7 @@ body:
       description: The UI Scale chosen in the game's options (or Scale= in UIScale.ini).
       placeholder: "200 %"
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: monitors
@@ -71,7 +71,7 @@ body:
         1: 3840x2160, Windows scaling 150 %, game runs here
         2: 1920x1080, Windows scaling 100 %
     validations:
-      required: true
+      required: false
 
   - type: input
     id: gpu
@@ -118,6 +118,4 @@ body:
       label: Checks
       options:
         - label: I tested with the latest release of the mod.
-          required: true
         - label: I closed the game before attaching the log, so the log is complete.
-          required: true
