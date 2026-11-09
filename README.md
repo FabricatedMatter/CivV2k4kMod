@@ -17,14 +17,15 @@ this to the base game's menu).
 
 ## Screenshots
 
-Zoomed in, same spot on a 4K screen, everything the same size. Left: the unmodded game at 1080p,
-stretched to the 4K screen. Middle: native 4K with UI Scale at 200 % and the game's original art.
-Right: the same with the hi-res art (it can be switched off with `AIArt=0`).
+The same section of a 4K screen three times, zoomed in, everything the same size. Left: the
+unmodded game at 1080p, stretched to the 4K screen. Middle: native 4K with UI Scale at 200 % and
+the game's original art. Right: the same with the hi-res art (it can be switched off with
+`AIArt=0`).
 
-![City banner and unit flags](docs/compare_city_banner.jpg)
-![Main menu](docs/compare_main_menu.jpg)
-![Tech tree](docs/compare_tech_tree.jpg)
-![Social policies](docs/compare_social_policies.jpg)
+![City banner and unit flags](docs/panels_city_banner.jpg)
+![Main menu](docs/panels_main_menu.jpg)
+![Tech tree](docs/panels_tech_tree.jpg)
+![Social policies](docs/panels_social_policies.jpg)
 
 The UI Scale slider in *Options → Interface Options*, and what it does at 4K: the top-right corner
 of the map view at 100, 150 and 200 %.
